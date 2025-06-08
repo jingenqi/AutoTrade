@@ -179,19 +179,34 @@ contract FlashLoanArbitrage is IFlashLoanReceiver, Ownable, ReentrancyGuard {
      */
     function _findBestTrade(uint256 _amountIn, address _token0, address _token1) internal view returns (TradeRoute memory) {
         TradeRoute memory route;
-        
+        route.bestAmountOut = 0; // 显式初始化
+
         address[] memory dexes = new address[](3);
         dexes[0] = uniswapRouter;
         dexes[1] = sushiRouter;
         dexes[2] = oneInchRouter;
+        
+        uint256 dexCount = dexes.length;
+        uint256[] memory amountsOutAfterBuy = new uint256[](dexCount);
 
-        for (uint i = 0; i < dexes.length; i++) {
-            for (uint j = 0; j < dexes.length; j++) {
-                if (i == j) continue;
-                uint256 amountOutAfterBuy = getAmountOut(dexes[i], _amountIn, _token0, _token1);
-                if (amountOutAfterBuy == 0) continue;
+        // 1. 批量获取所有 DEXs 的初始买入数量 (token0 -> token1)
+        for (uint i = 0; i < dexCount; i++) {
+            amountsOutAfterBuy[i] = getAmountOut(dexes[i], _amountIn, _token0, _token1);
+        }
+
+        // 2. 遍历买入结果，为每个结果寻找最佳的卖出价格
+        for (uint i = 0; i < dexCount; i++) {
+            if (amountsOutAfterBuy[i] == 0) {
+                continue;
+            }
+            
+            for (uint j = 0; j < dexCount; j++) {
+                if (i == j) {
+                    continue;
+                }
+
+                uint256 finalAmountOut = getAmountOut(dexes[j], amountsOutAfterBuy[i], _token1, _token0);
                 
-                uint256 finalAmountOut = getAmountOut(dexes[j], amountOutAfterBuy, _token1, _token0);
                 if (finalAmountOut > route.bestAmountOut) {
                     route.bestAmountOut = finalAmountOut;
                     route.dexToBuy = dexes[i];
