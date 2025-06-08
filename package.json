@@ -1,0 +1,21 @@
+{
+  "name": "autotrade",
+  "version": "1.0.0",
+  "description": "Solidity 套利机器人：技术文档 (v0.8.x 更新版)\r 1. 概述\r 本文档为基于 Solidity 的套利机器人提供了技术规范。该机器人旨在利用加密资产在各个去中心化交易所（DEX）之间的价格差异。它利用 Aave V2 的闪电贷功能，无需任何前期资本即可借入资产进行套利，执行交易，并在单个原子交易中偿还贷款。",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@openzeppelin/contracts": "^5.3.0",
+    "dotenv": "^16.5.0",
+    "ethers": "^6.14.3"
+  },
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "^5.0.0",
+    "hardhat": "^2.24.2"
+  }
+}
