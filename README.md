@@ -118,13 +118,21 @@ ErrorLog(string message)：在交易执行失败时发出。
 
 部署到主网：该合约旨在用于以太坊主网。部署时，需要在构造函数中提供以下参数：
 
-Aave LendingPoolAddressesProvider 地址。
+* Aave LendingPoolAddressesProvider 地址。
+_addressesProvider (Aave V2):
+0xB53C1a33016B2DC2fF3653530bfF1848a515c8c5
 
-Uniswap V2 Router 地址。
+* Uniswap V2 Router 地址。
+_uniswapRouter (Uniswap V2):
+0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D
 
-SushiSwap Router 地址。
+* SushiSwap Router 地址。
+_sushiRouter (SushiSwap):
+0xd9e1cE17f2641f24aE83637ab66a2cca9C378B9F
 
-1inch Router 地址。
+* 1inch Router 地址。
+_oneInchRouter (1inch v5):
+0x1111111254EEB25477B68fb85Ed929f73A960582
 
 准备 Gas 费用：确保合约所有者的钱包中有足够的 ETH 来支付部署和交易的 gas 费用。
 
