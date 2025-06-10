@@ -174,18 +174,23 @@ contract FlashLoanArbitrage is IFlashLoanReceiver, Ownable, ReentrancyGuard {
 
         // 交易 1: 用借来的 `loanToken` 购买 `otherToken`
         // 此处 amountOutMin 设置为0，因为我们信任链下计算，并且真正的保护在第二步
-        uint256 amountReceived = _executeTrade(buyRouter, loanToken, otherToken, loanAmount, 0);
-        if (amountReceived == 0) {
+        uint256 reportedAmountReceived = _executeTrade(buyRouter, loanToken, otherToken, loanAmount, 0);
+        if (reportedAmountReceived == 0) {
              emit ErrorLog("Buy trade failed", params);
              return false; // 回滚状态
         }
+
+        // 【优化】为了稳健地处理"转账即收费"(Fee-on-Transfer) 的代币，
+        // 我们不依赖 DEX 报告的转出数量，而是直接查询本合约收到的实际 `otherToken` 余额。
+        uint256 actualAmountReceived = IERC20(otherToken).balanceOf(address(this));
+        require(actualAmountReceived > 0, "Actual otherToken balance is zero after trade");
 
         // 这是我们从第二笔交易中需要收回的最低金额，以确保盈利。
         // 这是我们对抗三明治攻击的【关键防线】。
         uint256 minAmountOutFromSell = amountToRepay + minProfit;
 
-        // 交易 2: 将 `otherToken` 卖回 `loanToken`
-        uint256 finalAmount = _executeTrade(sellRouter, otherToken, loanToken, amountReceived, minAmountOutFromSell);
+        // 交易 2: 将 `otherToken` 卖回 `loanToken`，使用实际收到的金额
+        uint256 finalAmount = _executeTrade(sellRouter, otherToken, loanToken, actualAmountReceived, minAmountOutFromSell);
         if (finalAmount < minAmountOutFromSell) {
             emit ErrorLog("Sell trade failed or insufficient profit", params);
             return false; // 回滚状态
