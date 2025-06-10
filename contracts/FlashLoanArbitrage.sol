@@ -7,7 +7,7 @@ import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
-
+using SafeERC20 for IERC20;
 // --- 本地接口定义以避免编译器版本冲突 ---
 
 // Aave V2 闪电贷接收者接口
@@ -41,7 +41,6 @@ interface ILendingPoolAddressesProvider {
 
 // Uniswap V2 路由器接口
 interface IUniswapV2Router02 {
-    function getAmountsOut(uint amountIn, address[] calldata path) external view returns (uint[] memory amounts);
     function swapExactTokensForTokens(
         uint amountIn,
         uint amountOutMin,
@@ -52,10 +51,12 @@ interface IUniswapV2Router02 {
 }
 
 /**
- * @title 合法的闪电贷套利机器人 (Solidity v0.8.x)
- * @author Gemini
- * @notice 本智能合约利用 Aave 的闪电贷在多个去中心化交易所（DEX）之间执行套利机会。
- * 它通过重入保护、所有权和访问控制机制确保交易的安全和盈利。
+ * @title 工业级闪电贷套利合约
+ * @author Gemini (针对MEV风险升级)
+ * @notice 本合约是一个纯粹的套利交易"执行引擎"。
+ * 所有的机会发现、路径计算和利润评估都必须在链下完成。
+ * 它被设计为由一个链下机器人控制，该机器人提供精确的交易参数，
+ * 包括严格的滑点保护，以最小化链上Gas成本并有效防御三明治攻击。
  */
 contract FlashLoanArbitrage is IFlashLoanReceiver, Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
@@ -76,18 +77,17 @@ contract FlashLoanArbitrage is IFlashLoanReceiver, Ownable, ReentrancyGuard {
     // WETH 地址 (Mainnet)
     address public constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
     
-    // 用于返回最佳交易路径的结构体
-    struct TradeRoute {
-        uint256 bestAmountOut;
-        address dexToBuy;
-        address dexToSell;
-    }
-
     // 事件日志
-    event FlashLoanExecuted(address indexed asset, uint256 amount, string message);
-    event ArbitrageExecuted(address indexed tokenIn, address indexed tokenOut, uint256 amountIn, uint256 amountOut, address dexBuy, address dexSell);
-    event ProfitLog(uint256 profit);
-    event ErrorLog(string message);
+    event ArbitrageExecuted(
+        address indexed tokenIn, 
+        address indexed tokenOut, 
+        uint256 amountIn, 
+        uint256 amountOut, 
+        address dexBuy, 
+        address dexSell,
+        uint256 profit
+    );
+    event ErrorLog(string message, bytes params);
 
     /**
      * @dev 构造函数，初始化所有必要的合约地址。
@@ -106,41 +106,50 @@ contract FlashLoanArbitrage is IFlashLoanReceiver, Ownable, ReentrancyGuard {
     }
 
     /**
-     * @notice 启动套利交易的主函数。
+     * @notice 由链下机器人调用的主入口函数。
+     * @param _loanToken 需要通过闪电贷借入的代币 (例如 WETH)。
+     * @param _otherToken 与之交易的另一个代币。
+     * @param _loanAmount 要借入的 `_loanToken` 的数量。
+     * @param _buyRouter 用于第一笔交易的DEX路由器地址 (买入 `_otherToken`)。
+     * @param _sellRouter 用于第二笔交易的DEX路由器地址 (卖出 `_otherToken`)。
+     * @param _minProfit 交易成功的最低利润要求 (以 `_loanToken` 为单位)。
      */
     function performArbitrage(
-        address _token0,
-        address _token1,
-        uint256 _flashLoanAmount
+        address _loanToken,
+        address _otherToken,
+        uint256 _loanAmount,
+        address _buyRouter,
+        address _sellRouter,
+        uint256 _minProfit
     ) external onlyOwner nonReentrant {
-        require(_flashLoanAmount > 0, "Flash loan amount must be greater than zero");
-
-        address receiverAddress = address(this);
+        require(_loanAmount > 0, "Loan amount must be greater than zero");
+        
         address[] memory assets = new address[](1);
-        assets[0] = _token0;
+        assets[0] = _loanToken;
 
         uint256[] memory amounts = new uint256[](1);
-        amounts[0] = _flashLoanAmount;
+        amounts[0] = _loanAmount;
 
+        // 使用无债务代币模式 (mode 0)
         uint256[] memory modes = new uint256[](1);
-        modes[0] = 0; // 0 for no debt token
+        modes[0] = 0; 
 
-        bytes memory params = abi.encode(_token0, _token1);
+        // 将所有必要参数编码，以便在回调函数中使用
+        bytes memory params = abi.encode(_loanToken, _otherToken, _buyRouter, _sellRouter, _minProfit);
 
         lendingPool.flashLoan(
-            receiverAddress,
+            address(this),
             assets,
             amounts,
             modes,
             address(this),
             params,
-            0
+            0 // 无推荐码
         );
-        emit FlashLoanExecuted(_token0, _flashLoanAmount, "Flash loan requested successfully.");
     }
 
     /**
-     * @notice Aave 闪电贷的回调函数，包含核心套利逻辑。
+     * @notice 这是Aave V2的回调函数，包含核心的套利和还款逻辑。
      */
     function executeOperation(
         address[] calldata assets,
@@ -149,130 +158,77 @@ contract FlashLoanArbitrage is IFlashLoanReceiver, Ownable, ReentrancyGuard {
         address, // initiator
         bytes calldata params
     ) external override returns (bool) {
-        require(msg.sender == address(lendingPool), "Caller is not Aave LendingPool");
+        // --- 安全检查 ---
+        require(msg.sender == address(lendingPool), "Caller must be Aave LendingPool");
+        require(assets.length == 1, "Invalid asset count");
 
-        (address token0, address token1) = abi.decode(params, (address, address));
-        uint256 flashLoanAmount = amounts[0];
-        uint256 loanRepaymentAmount = flashLoanAmount + premiums[0];
-
-        // 1. 寻找最佳套利机会
-        TradeRoute memory bestRoute = _findBestTrade(flashLoanAmount, token0, token1);
-        require(bestRoute.bestAmountOut > loanRepaymentAmount, "Arbitrage is not profitable");
+        // --- 解码从 `performArbitrage` 传来的参数 ---
+        (address loanToken, address otherToken, address buyRouter, address sellRouter, uint256 minProfit) = 
+            abi.decode(params, (address, address, address, address, uint256));
         
-        // 2. 执行完整的交易序列 (买入和卖出)
-        uint256 finalAmountReceived = _executeFullTrade(bestRoute, flashLoanAmount, token0, token1);
-        require(finalAmountReceived >= loanRepaymentAmount, "Sell trade did not cover loan repayment");
-        
-        // 3. 偿还闪电贷
-        IERC20(assets[0]).approve(address(lendingPool), loanRepaymentAmount);
+        uint256 loanAmount = amounts[0];
+        uint256 premium = premiums[0];
+        uint256 amountToRepay = loanAmount + premium;
 
-        // 4. 记录日志
-        uint256 profit = finalAmountReceived - loanRepaymentAmount;
-        emit ArbitrageExecuted(token0, token1, flashLoanAmount, finalAmountReceived, bestRoute.dexToBuy, bestRoute.dexToSell);
-        emit ProfitLog(profit);
+        // --- 执行交易序列 ---
+
+        // 交易 1: 用借来的 `loanToken` 购买 `otherToken`
+        // 此处 amountOutMin 设置为0，因为我们信任链下计算，并且真正的保护在第二步
+        uint256 amountReceived = _executeTrade(buyRouter, loanToken, otherToken, loanAmount, 0);
+        if (amountReceived == 0) {
+             emit ErrorLog("Buy trade failed", params);
+             return false; // 回滚状态
+        }
+
+        // 这是我们从第二笔交易中需要收回的最低金额，以确保盈利。
+        // 这是我们对抗三明治攻击的【关键防线】。
+        uint256 minAmountOutFromSell = amountToRepay + minProfit;
+
+        // 交易 2: 将 `otherToken` 卖回 `loanToken`
+        uint256 finalAmount = _executeTrade(sellRouter, otherToken, loanToken, amountReceived, minAmountOutFromSell);
+        if (finalAmount < minAmountOutFromSell) {
+            emit ErrorLog("Sell trade failed or insufficient profit", params);
+            return false; // 回滚状态
+        }
+
+        // --- 偿还闪电贷 ---
+        IERC20 loanTokenContract = IERC20(loanToken);
+        loanTokenContract.approve(address(lendingPool), amountToRepay);
+
+        // --- 记录利润和成功事件 ---
+        uint256 actualProfit = finalAmount - amountToRepay;
+        emit ArbitrageExecuted(loanToken, otherToken, loanAmount, finalAmount, buyRouter, sellRouter, actualProfit);
 
         return true;
     }
     
     /**
-     * @dev 内部辅助函数，用于寻找最佳交易路径以避免主函数堆栈过深。
+     * @dev 在兼容Uniswap V2的路由器上执行交易的内部辅助函数。
+     * @return 收到的 `tokenOut` 的数量。
      */
-    function _findBestTrade(uint256 _amountIn, address _token0, address _token1) internal view returns (TradeRoute memory) {
-        TradeRoute memory route;
-        route.bestAmountOut = 0; // 显式初始化
-
-        address[] memory dexes = new address[](3);
-        dexes[0] = uniswapRouter;
-        dexes[1] = sushiRouter;
-        dexes[2] = oneInchRouter;
-        
-        uint256 dexCount = dexes.length;
-        uint256[] memory amountsOutAfterBuy = new uint256[](dexCount);
-
-        // 1. 批量获取所有 DEXs 的初始买入数量 (token0 -> token1)
-        for (uint i = 0; i < dexCount; i++) {
-            amountsOutAfterBuy[i] = getAmountOut(dexes[i], _amountIn, _token0, _token1);
-        }
-
-        // 2. 遍历买入结果，为每个结果寻找最佳的卖出价格
-        for (uint i = 0; i < dexCount; i++) {
-            if (amountsOutAfterBuy[i] == 0) {
-                continue;
-            }
-            
-            for (uint j = 0; j < dexCount; j++) {
-                if (i == j) {
-                    continue;
-                }
-
-                uint256 finalAmountOut = getAmountOut(dexes[j], amountsOutAfterBuy[i], _token1, _token0);
-                
-                if (finalAmountOut > route.bestAmountOut) {
-                    route.bestAmountOut = finalAmountOut;
-                    route.dexToBuy = dexes[i];
-                    route.dexToSell = dexes[j];
-                }
-            }
-        }
-        return route;
-    }
-    
-    /**
-     * @dev 新增的内部辅助函数，封装买卖交易以减少 executeOperation 的堆栈深度。
-     */
-    function _executeFullTrade(TradeRoute memory route, uint256 amountIn, address token0, address token1) internal returns (uint256) {
-        // 执行买入交易
-        uint256 amountReceived = executeTrade(route.dexToBuy, token0, token1, amountIn);
-        require(amountReceived > 0, "Buy trade failed on DEX");
-        
-        // 执行卖出交易
-        uint256 finalAmount = executeTrade(route.dexToSell, token1, token0, amountReceived);
-        return finalAmount;
-    }
-
-    /**
-     * @dev 在指定的 DEX 上执行代币交换的内部函数。
-     */
-    function executeTrade(address router, address tokenIn, address tokenOut, uint256 amountIn) internal returns (uint256) {
-        IERC20(tokenIn).approve(router, amountIn);
+    function _executeTrade(address router, address tokenIn, address tokenOut, uint256 amountIn, uint256 amountOutMin) internal returns (uint256) {
+        IERC20 tokenInContract = IERC20(tokenIn);
+        tokenInContract.approve(router, amountIn);
 
         address[] memory path = new address[](2);
         path[0] = tokenIn;
         path[1] = tokenOut;
-
-        uint[] memory amountsOut = IUniswapV2Router02(router).getAmountsOut(amountIn, path);
-        uint amountOutMin = amountsOut[1] * 98 / 100; // 2% slippage
-
+        
         try IUniswapV2Router02(router).swapExactTokensForTokens(
             amountIn,
-            amountOutMin,
+            amountOutMin, // 关键的滑点保护
             path,
             address(this),
-            block.timestamp + 120
+            block.timestamp // 交易立即执行，无需等待
         ) returns (uint[] memory receivedAmounts) {
              return receivedAmounts[1];
         } catch {
-            emit ErrorLog("swapExactTokensForTokens failed.");
             return 0;
         }
     }
 
     /**
-     * @dev 获取交换预期输出金额的内部函数。
-     */
-    function getAmountOut(address router, uint256 amountIn, address tokenIn, address tokenOut) internal view returns (uint256) {
-        address[] memory path = new address[](2);
-        path[0] = tokenIn;
-        path[1] = tokenOut;
-        try IUniswapV2Router02(router).getAmountsOut(amountIn, path) returns (uint[] memory amounts) {
-            return amounts[1];
-        } catch {
-            return 0;
-        }
-    }
-
-    /**
-     * @notice 从合约中提取累积的利润。
+     * @notice 允许合约所有者提取累积的利润。
      */
     function withdraw(address _tokenAddress) external onlyOwner {
         IERC20 token = IERC20(_tokenAddress);
@@ -284,3 +240,4 @@ contract FlashLoanArbitrage is IFlashLoanReceiver, Ownable, ReentrancyGuard {
     // 接收 ETH 的 fallback 函数
     receive() external payable {}
 } 
+

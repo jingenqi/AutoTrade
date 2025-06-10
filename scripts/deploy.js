@@ -1,7 +1,7 @@
 const { ethers } = require("hardhat");
 
 async function main() {
-  console.log("🚀 Starting deployment...");
+  console.log("Starting deployment...");
 
   // --- 您提供的地址 ---
   const addresses = {
@@ -26,8 +26,8 @@ async function main() {
 
   await arbitrageContract.deployed();
 
-  console.log("✅ Contract deployed successfully!");
-  console.log("📜 Contract Address:", arbitrageContract.address);
+  console.log("Contract deployed successfully!");
+  console.log("Contract Address:", arbitrageContract.address);
   console.log("\n-------------------------------------------------");
   console.log("Next steps:");
   console.log("1. Copy the contract address above.");
@@ -39,6 +39,6 @@ async function main() {
 main()
   .then(() => process.exit(0))
   .catch(error => {
-    console.error("❌ Deployment failed:", error);
+    console.error("Deployment failed:", error);
     process.exit(1);
   }); 
