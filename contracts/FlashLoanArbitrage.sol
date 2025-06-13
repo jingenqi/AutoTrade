@@ -10,7 +10,9 @@ import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 using SafeERC20 for IERC20;
 // --- 本地接口定义以避免编译器版本冲突 ---
 
-// Aave V2 闪电贷接收者接口
+// --- 【V3 兼容性修改】接口已更新以适配 Aave V3 ---
+
+// Aave V3 闪电贷接收者接口 (与V2兼容)
 interface IFlashLoanReceiver {
     function executeOperation(
         address[] calldata assets,
@@ -21,22 +23,22 @@ interface IFlashLoanReceiver {
     ) external returns (bool);
 }
 
-// Aave V2 借贷池接口 (仅包含所需函数)
-interface ILendingPool {
+// Aave V3 核心池接口 (替换了 V2 的 ILendingPool)
+interface IPool {
     function flashLoan(
         address receiverAddress,
         address[] calldata assets,
         uint256[] calldata amounts,
-        uint256[] calldata modes,
+        uint256[] calldata interestRateModes, // 在V3中称为 interestRateModes
         address onBehalfOf,
         bytes calldata params,
         uint16 referralCode
     ) external;
 }
 
-// Aave V2 地址提供者接口 (仅包含所需函数)
-interface ILendingPoolAddressesProvider {
-    function getLendingPool() external view returns (address);
+// Aave V3 地址提供者接口 (替换了 V2 的 ILendingPoolAddressesProvider)
+interface IPoolAddressesProvider {
+    function getPool() external view returns (address); // 函数名为 getPool()
 }
 
 // Uniswap V2 路由器接口
@@ -61,11 +63,13 @@ interface IUniswapV2Router02 {
 contract FlashLoanArbitrage is IFlashLoanReceiver, Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
-    ILendingPoolAddressesProvider public immutable addressesProvider;
-    ILendingPool public immutable lendingPool;
+    // 【V3 兼容性修改】使用 Aave V3 的接口
+    IPoolAddressesProvider public immutable addressesProvider;
+    IPool public immutable pool;
 
     // --- 主要网络的合约地址 ---
-    // Aave Lending Pool Address Provider (Mainnet): 0xB53C1a33016B2DC2fF3653530bfF1848a515c8c5
+    // Aave V3 Pool Address Provider (Mainnet): 0x2f39d218133AFaB8F2B819B1066c7E434Ad94E9e
+    // Aave V2 Lending Pool Address Provider (Mainnet): 0xB53C1a33016B2DC2fF3653530bfF1848a515c8c5
     // Uniswap V2 Router (Mainnet): 0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D
     // SushiSwap Router (Mainnet): 0xd9e1cE17f2641f24aE83637ab66a2cca9C378B9F
     // 1inch Router (Mainnet): 0x1111111254EEB25477B68fb85Ed929f73A960582 (v5)
@@ -89,6 +93,16 @@ contract FlashLoanArbitrage is IFlashLoanReceiver, Ownable, ReentrancyGuard {
     );
     event ErrorLog(string message, bytes params);
 
+    // 新增：定义一个结构体来保存交易参数，避免"Stack too deep"错误
+    struct TradeData {
+        address loanToken;
+        address otherToken;
+        address buyRouter;
+        address sellRouter;
+        uint256 minProfit;
+        uint256 loanAmount;
+    }
+
     /**
      * @dev 构造函数，初始化所有必要的合约地址。
      */
@@ -98,8 +112,8 @@ contract FlashLoanArbitrage is IFlashLoanReceiver, Ownable, ReentrancyGuard {
         address _sushiRouter,
         address _oneInchRouter
     ) Ownable(msg.sender) { // 调用 Ownable 的构造函数来设置初始所有者
-        addressesProvider = ILendingPoolAddressesProvider(_addressesProvider);
-        lendingPool = ILendingPool(addressesProvider.getLendingPool());
+        addressesProvider = IPoolAddressesProvider(_addressesProvider);
+        pool = IPool(addressesProvider.getPool()); // 【V3 兼容性修改】调用 getPool()
         uniswapRouter = _uniswapRouter;
         sushiRouter = _sushiRouter;
         oneInchRouter = _oneInchRouter;
@@ -130,14 +144,25 @@ contract FlashLoanArbitrage is IFlashLoanReceiver, Ownable, ReentrancyGuard {
         uint256[] memory amounts = new uint256[](1);
         amounts[0] = _loanAmount;
 
-        // 使用无债务代币模式 (mode 0)
+        // 使用无债务代币模式 (mode 0 for V2, interestRateMode 0 for V3)
+        // 类型为 uint256[]，兼容两个版本
         uint256[] memory modes = new uint256[](1);
         modes[0] = 0; 
 
-        // 将所有必要参数编码，以便在回调函数中使用
-        bytes memory params = abi.encode(_loanToken, _otherToken, _buyRouter, _sellRouter, _minProfit);
+        // 更新：使用结构体来打包参数
+        TradeData memory trade = TradeData({
+            loanToken: _loanToken,
+            otherToken: _otherToken,
+            buyRouter: _buyRouter,
+            sellRouter: _sellRouter,
+            minProfit: _minProfit,
+            loanAmount: _loanAmount
+        });
+        
+        // 将整个结构体编码到 params 中
+        bytes memory params = abi.encode(trade);
 
-        lendingPool.flashLoan(
+        pool.flashLoan( // 【V3 兼容性修改】调用 pool.flashLoan
             address(this),
             assets,
             amounts,
@@ -149,32 +174,29 @@ contract FlashLoanArbitrage is IFlashLoanReceiver, Ownable, ReentrancyGuard {
     }
 
     /**
-     * @notice 这是Aave V2的回调函数，包含核心的套利和还款逻辑。
+     * @notice 这是Aave的回调函数，包含核心的套利和还款逻辑。
      */
     function executeOperation(
         address[] calldata assets,
-        uint256[] calldata amounts,
+        uint256[] calldata, // amounts 现在已包含在params中，此处省略
         uint256[] calldata premiums,
         address, // initiator
         bytes calldata params
     ) external override returns (bool) {
         // --- 安全检查 ---
-        require(msg.sender == address(lendingPool), "Caller must be Aave LendingPool");
+        require(msg.sender == address(pool), "Caller must be Aave Pool"); // 【V3 兼容性修改】检查调用者是否为 Aave V3 Pool
         require(assets.length == 1, "Invalid asset count");
 
-        // --- 解码从 `performArbitrage` 传来的参数 ---
-        (address loanToken, address otherToken, address buyRouter, address sellRouter, uint256 minProfit) = 
-            abi.decode(params, (address, address, address, address, uint256));
+        // 更新：将参数解码到内存中的单个结构体中
+        TradeData memory trade = abi.decode(params, (TradeData));
         
-        uint256 loanAmount = amounts[0];
         uint256 premium = premiums[0];
-        uint256 amountToRepay = loanAmount + premium;
+        uint256 amountToRepay = trade.loanAmount + premium;
 
         // --- 执行交易序列 ---
 
         // 交易 1: 用借来的 `loanToken` 购买 `otherToken`
-        // 此处 amountOutMin 设置为0，因为我们信任链下计算，并且真正的保护在第二步
-        uint256 reportedAmountReceived = _executeTrade(buyRouter, loanToken, otherToken, loanAmount, 0);
+        uint256 reportedAmountReceived = _executeTrade(trade.buyRouter, trade.loanToken, trade.otherToken, trade.loanAmount, 0);
         if (reportedAmountReceived == 0) {
              emit ErrorLog("Buy trade failed", params);
              return false; // 回滚状态
@@ -182,27 +204,28 @@ contract FlashLoanArbitrage is IFlashLoanReceiver, Ownable, ReentrancyGuard {
 
         // 【优化】为了稳健地处理"转账即收费"(Fee-on-Transfer) 的代币，
         // 我们不依赖 DEX 报告的转出数量，而是直接查询本合约收到的实际 `otherToken` 余额。
-        uint256 actualAmountReceived = IERC20(otherToken).balanceOf(address(this));
+        uint256 actualAmountReceived = IERC20(trade.otherToken).balanceOf(address(this));
         require(actualAmountReceived > 0, "Actual otherToken balance is zero after trade");
 
         // 这是我们从第二笔交易中需要收回的最低金额，以确保盈利。
         // 这是我们对抗三明治攻击的【关键防线】。
-        uint256 minAmountOutFromSell = amountToRepay + minProfit;
+        uint256 minAmountOutFromSell = amountToRepay + trade.minProfit;
 
         // 交易 2: 将 `otherToken` 卖回 `loanToken`，使用实际收到的金额
-        uint256 finalAmount = _executeTrade(sellRouter, otherToken, loanToken, actualAmountReceived, minAmountOutFromSell);
+        uint256 finalAmount = _executeTrade(trade.sellRouter, trade.otherToken, trade.loanToken, actualAmountReceived, minAmountOutFromSell);
         if (finalAmount < minAmountOutFromSell) {
             emit ErrorLog("Sell trade failed or insufficient profit", params);
             return false; // 回滚状态
         }
 
         // --- 偿还闪电贷 ---
-        IERC20 loanTokenContract = IERC20(loanToken);
-        loanTokenContract.approve(address(lendingPool), amountToRepay);
+        IERC20(trade.loanToken).approve(address(pool), amountToRepay); // 【V3 兼容性修改】授权给 Aave V3 Pool
 
         // --- 记录利润和成功事件 ---
         uint256 actualProfit = finalAmount - amountToRepay;
-        emit ArbitrageExecuted(loanToken, otherToken, loanAmount, finalAmount, buyRouter, sellRouter, actualProfit);
+        
+        // 更新：现在这一行可以无误地编译
+        emit ArbitrageExecuted(trade.loanToken, trade.otherToken, trade.loanAmount, finalAmount, trade.buyRouter, trade.sellRouter, actualProfit);
 
         return true;
     }
