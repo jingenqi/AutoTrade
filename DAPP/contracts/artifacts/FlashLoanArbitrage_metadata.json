@@ -1,33 +1,12 @@
 {
 	"compiler": {
-		"version": "0.8.20+commit.a1b79de6"
+		"version": "0.8.26+commit.8a97fa7a"
 	},
 	"language": "Solidity",
 	"output": {
 		"abi": [
 			{
-				"inputs": [
-					{
-						"internalType": "address",
-						"name": "_addressesProvider",
-						"type": "address"
-					},
-					{
-						"internalType": "address",
-						"name": "_uniswapRouter",
-						"type": "address"
-					},
-					{
-						"internalType": "address",
-						"name": "_sushiRouter",
-						"type": "address"
-					},
-					{
-						"internalType": "address",
-						"name": "_oneInchRouter",
-						"type": "address"
-					}
-				],
+				"inputs": [],
 				"stateMutability": "nonpayable",
 				"type": "constructor"
 			},
@@ -75,25 +54,25 @@
 					{
 						"indexed": true,
 						"internalType": "address",
-						"name": "tokenIn",
+						"name": "loanToken",
 						"type": "address"
 					},
 					{
 						"indexed": true,
 						"internalType": "address",
-						"name": "tokenOut",
+						"name": "otherToken",
 						"type": "address"
 					},
 					{
 						"indexed": false,
 						"internalType": "uint256",
-						"name": "amountIn",
+						"name": "loanAmount",
 						"type": "uint256"
 					},
 					{
 						"indexed": false,
 						"internalType": "uint256",
-						"name": "amountOut",
+						"name": "receivedAmount",
 						"type": "uint256"
 					},
 					{
@@ -122,19 +101,32 @@
 				"anonymous": false,
 				"inputs": [
 					{
-						"indexed": false,
-						"internalType": "string",
-						"name": "message",
-						"type": "string"
+						"indexed": true,
+						"internalType": "address",
+						"name": "newBeneficiary",
+						"type": "address"
+					}
+				],
+				"name": "BeneficiaryChanged",
+				"type": "event"
+			},
+			{
+				"anonymous": false,
+				"inputs": [
+					{
+						"indexed": true,
+						"internalType": "address",
+						"name": "token",
+						"type": "address"
 					},
 					{
 						"indexed": false,
-						"internalType": "bytes",
-						"name": "params",
-						"type": "bytes"
+						"internalType": "uint256",
+						"name": "amount",
+						"type": "uint256"
 					}
 				],
-				"name": "ErrorLog",
+				"name": "FundsWithdrawn",
 				"type": "event"
 			},
 			{
@@ -158,23 +150,10 @@
 			},
 			{
 				"inputs": [],
-				"name": "WETH",
+				"name": "beneficiary",
 				"outputs": [
 					{
 						"internalType": "address",
-						"name": "",
-						"type": "address"
-					}
-				],
-				"stateMutability": "view",
-				"type": "function"
-			},
-			{
-				"inputs": [],
-				"name": "addressesProvider",
-				"outputs": [
-					{
-						"internalType": "contract ILendingPoolAddressesProvider",
 						"name": "",
 						"type": "address"
 					}
@@ -191,7 +170,7 @@
 					},
 					{
 						"internalType": "uint256[]",
-						"name": "amounts",
+						"name": "",
 						"type": "uint256[]"
 					},
 					{
@@ -223,25 +202,27 @@
 			},
 			{
 				"inputs": [],
-				"name": "lendingPool",
-				"outputs": [
-					{
-						"internalType": "contract ILendingPool",
-						"name": "",
-						"type": "address"
-					}
-				],
-				"stateMutability": "view",
-				"type": "function"
-			},
-			{
-				"inputs": [],
-				"name": "oneInchRouter",
+				"name": "getContractStatus",
 				"outputs": [
 					{
 						"internalType": "address",
-						"name": "",
+						"name": "_owner",
 						"type": "address"
+					},
+					{
+						"internalType": "address",
+						"name": "_beneficiary",
+						"type": "address"
+					},
+					{
+						"internalType": "uint256",
+						"name": "_ethBalance",
+						"type": "uint256"
+					},
+					{
+						"internalType": "uint256",
+						"name": "_wethBalance",
+						"type": "uint256"
 					}
 				],
 				"stateMutability": "view",
@@ -289,6 +270,11 @@
 					},
 					{
 						"internalType": "uint256",
+						"name": "_minAmountOutFirstTrade",
+						"type": "uint256"
+					},
+					{
+						"internalType": "uint256",
 						"name": "_minProfit",
 						"type": "uint256"
 					}
@@ -306,16 +292,16 @@
 				"type": "function"
 			},
 			{
-				"inputs": [],
-				"name": "sushiRouter",
-				"outputs": [
+				"inputs": [
 					{
 						"internalType": "address",
-						"name": "",
+						"name": "_newBeneficiary",
 						"type": "address"
 					}
 				],
-				"stateMutability": "view",
+				"name": "setBeneficiary",
+				"outputs": [],
+				"stateMutability": "nonpayable",
 				"type": "function"
 			},
 			{
@@ -333,15 +319,9 @@
 			},
 			{
 				"inputs": [],
-				"name": "uniswapRouter",
-				"outputs": [
-					{
-						"internalType": "address",
-						"name": "",
-						"type": "address"
-					}
-				],
-				"stateMutability": "view",
+				"name": "withdrawAll",
+				"outputs": [],
+				"stateMutability": "nonpayable",
 				"type": "function"
 			},
 			{
@@ -352,7 +332,7 @@
 						"type": "address"
 					}
 				],
-				"name": "withdraw",
+				"name": "withdrawToken",
 				"outputs": [],
 				"stateMutability": "nonpayable",
 				"type": "function"
@@ -389,19 +369,24 @@
 			"kind": "dev",
 			"methods": {
 				"constructor": {
-					"details": "构造函数，初始化所有必要的合约地址。"
+					"details": "构造函数，初始化所有必要的合约地址和受益人。"
+				},
+				"executeOperation(address[],uint256[],uint256[],address,bytes)": {
+					"details": "Aave闪电贷回调函数。所有核心套利逻辑在此执行。"
 				},
 				"owner()": {
 					"details": "Returns the address of the current owner."
 				},
-				"performArbitrage(address,address,uint256,address,address,uint256)": {
+				"performArbitrage(address,address,uint256,address,address,uint256,uint256)": {
+					"details": "所有参数由链下机器人计算和提供，确保最佳执行。",
 					"params": {
-						"_buyRouter": "用于第一笔交易的DEX路由器地址 (买入 `_otherToken`)。",
-						"_loanAmount": "要借入的 `_loanToken` 的数量。",
-						"_loanToken": "需要通过闪电贷借入的代币 (例如 WETH)。",
-						"_minProfit": "交易成功的最低利润要求 (以 `_loanToken` 为单位)。",
-						"_otherToken": "与之交易的另一个代币。",
-						"_sellRouter": "用于第二笔交易的DEX路由器地址 (卖出 `_otherToken`)。"
+						"_buyRouter": "用于执行第一笔交易（买入）的DEX路由器地址",
+						"_loanAmount": "借贷数量",
+						"_loanToken": "借贷的代币地址 (例如 WETH)",
+						"_minAmountOutFirstTrade": "执行第一笔交易后，预期的最小otherToken数量（防滑点）",
+						"_minProfit": "期望的最小利润（以_loanToken计算）",
+						"_otherToken": "交易对中的另一个代币地址 (例如 DAI)",
+						"_sellRouter": "用于执行第二笔交易（卖出）的DEX路由器地址"
 					}
 				},
 				"renounceOwnership()": {
@@ -417,14 +402,20 @@
 		"userdoc": {
 			"kind": "user",
 			"methods": {
-				"executeOperation(address[],uint256[],uint256[],address,bytes)": {
-					"notice": "这是Aave V2的回调函数，包含核心的套利和还款逻辑。"
+				"getContractStatus()": {
+					"notice": "查看合约状态和余额"
 				},
-				"performArbitrage(address,address,uint256,address,address,uint256)": {
-					"notice": "由链下机器人调用的主入口函数。"
+				"performArbitrage(address,address,uint256,address,address,uint256,uint256)": {
+					"notice": "由机器人调用的主函数，用于发起一次闪电贷套利。"
 				},
-				"withdraw(address)": {
-					"notice": "允许合约所有者提取累积的利润。"
+				"setBeneficiary(address)": {
+					"notice": "更改资金受益人地址"
+				},
+				"withdrawAll()": {
+					"notice": "停止交易并提取所有资金到钱包"
+				},
+				"withdrawToken(address)": {
+					"notice": "提取指定ERC20代币"
 				}
 			},
 			"notice": "本合约是一个纯粹的套利交易\"执行引擎\"。 所有的机会发现、路径计算和利润评估都必须在链下完成。 它被设计为由一个链下机器人控制，该机器人提供精确的交易参数， 包括严格的滑点保护，以最小化链上Gas成本并有效防御三明治攻击。",
@@ -435,13 +426,13 @@
 		"compilationTarget": {
 			"AutoTrade/contracts/FlashLoanArbitrage.sol": "FlashLoanArbitrage"
 		},
-		"evmVersion": "shanghai",
+		"evmVersion": "cancun",
 		"libraries": {},
 		"metadata": {
 			"bytecodeHash": "ipfs"
 		},
 		"optimizer": {
-			"enabled": false,
+			"enabled": true,
 			"runs": 200
 		},
 		"remappings": []
@@ -520,11 +511,11 @@
 			]
 		},
 		"AutoTrade/contracts/FlashLoanArbitrage.sol": {
-			"keccak256": "0xd2872c43eaec3908ec4d54776e752e670852ebb5e2c206fd5b9ba4ba929063f6",
+			"keccak256": "0xc1ce99fff061c09b879bcd196f40c1e5ab91cdba7227254ed3977383015213ea",
 			"license": "MIT",
 			"urls": [
-				"bzz-raw://3197070bb24019385759f0b4fb58e40c0ddbb51544698354d434229b2173815d",
-				"dweb:/ipfs/QmZnvabCQVon6sjgT4DJ29DajQVmbarEQDp5N6XzCFZ5UX"
+				"bzz-raw://c2050979fc0c5f0d1052089dc1f86f92741dc76159be058145b5a048c81a2078",
+				"dweb:/ipfs/QmeWhD6XdL95SW2Zn83rmZxA8JxhTfM9BhDftZijaosfkD"
 			]
 		}
 	},

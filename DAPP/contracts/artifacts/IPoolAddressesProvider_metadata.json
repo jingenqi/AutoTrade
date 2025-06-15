@@ -1,47 +1,21 @@
 {
 	"compiler": {
-		"version": "0.8.20+commit.a1b79de6"
+		"version": "0.8.26+commit.8a97fa7a"
 	},
 	"language": "Solidity",
 	"output": {
 		"abi": [
 			{
-				"inputs": [
-					{
-						"internalType": "uint256",
-						"name": "amountIn",
-						"type": "uint256"
-					},
-					{
-						"internalType": "uint256",
-						"name": "amountOutMin",
-						"type": "uint256"
-					},
-					{
-						"internalType": "address[]",
-						"name": "path",
-						"type": "address[]"
-					},
-					{
-						"internalType": "address",
-						"name": "to",
-						"type": "address"
-					},
-					{
-						"internalType": "uint256",
-						"name": "deadline",
-						"type": "uint256"
-					}
-				],
-				"name": "swapExactTokensForTokens",
+				"inputs": [],
+				"name": "getPool",
 				"outputs": [
 					{
-						"internalType": "uint256[]",
-						"name": "amounts",
-						"type": "uint256[]"
+						"internalType": "address",
+						"name": "",
+						"type": "address"
 					}
 				],
-				"stateMutability": "nonpayable",
+				"stateMutability": "view",
 				"type": "function"
 			}
 		],
@@ -58,15 +32,15 @@
 	},
 	"settings": {
 		"compilationTarget": {
-			"AutoTrade/contracts/FlashLoanArbitrage.sol": "IUniswapV2Router02"
+			"AutoTrade/contracts/FlashLoanArbitrage.sol": "IPoolAddressesProvider"
 		},
-		"evmVersion": "shanghai",
+		"evmVersion": "cancun",
 		"libraries": {},
 		"metadata": {
 			"bytecodeHash": "ipfs"
 		},
 		"optimizer": {
-			"enabled": false,
+			"enabled": true,
 			"runs": 200
 		},
 		"remappings": []
@@ -145,11 +119,11 @@
 			]
 		},
 		"AutoTrade/contracts/FlashLoanArbitrage.sol": {
-			"keccak256": "0xd2872c43eaec3908ec4d54776e752e670852ebb5e2c206fd5b9ba4ba929063f6",
+			"keccak256": "0xc1ce99fff061c09b879bcd196f40c1e5ab91cdba7227254ed3977383015213ea",
 			"license": "MIT",
 			"urls": [
-				"bzz-raw://3197070bb24019385759f0b4fb58e40c0ddbb51544698354d434229b2173815d",
-				"dweb:/ipfs/QmZnvabCQVon6sjgT4DJ29DajQVmbarEQDp5N6XzCFZ5UX"
+				"bzz-raw://c2050979fc0c5f0d1052089dc1f86f92741dc76159be058145b5a048c81a2078",
+				"dweb:/ipfs/QmeWhD6XdL95SW2Zn83rmZxA8JxhTfM9BhDftZijaosfkD"
 			]
 		}
 	},
