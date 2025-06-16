@@ -32,13 +32,12 @@ from rich.live import Live
 
 # 从核心模块导入共享的数据契约
 from mt5_copier.python.core.events import TradeEvent, HeartbeatEvent
+# 从新的配置文件中导入所有ZMQ设置
+from mt5_copier.python.config.settings import (
+    ZMQ_SYNC_URI, ZMQ_BUS_URI, MSG_SYNC_REQUEST, MSG_SYNC_RESPONSE, MSG_HEARTBEAT
+)
 
-# ZMQ配置 (与EA的ZmqConfig.mqh保持一致)
-ZMQ_SYNC_URI = "ipc://mt5_sync.ipc"
-ZMQ_BUS_URI = "ipc://mt5_trade_bus.ipc"
-MSG_SYNC_REQUEST = "READY?"
-MSG_SYNC_RESPONSE = "ACK"
-MSG_HEARTBEAT = "HEARTBEAT"
+# ZMQ配置 (已移至 mt5_copier/python/config/settings.py)
 
 # --- 测试统计 ---
 class HarnessStats:

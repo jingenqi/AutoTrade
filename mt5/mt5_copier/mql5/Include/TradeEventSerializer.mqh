@@ -1,148 +1,95 @@
 //+------------------------------------------------------------------+
-//|                                          TradeEventSerializer.mqh |
+//|                                       TradeEventSerializer.mqh   |
 //|                                      MT5 Trade Copier System     |
-//|                                    Trade Event JSON Serializer   |
+//|                             Serializes trade events to JSON      |
 //+------------------------------------------------------------------+
 #property copyright "MT5 Trade Copier System"
-#property version   "1.00"
+#property version   "4.0" // Final, robust version
+#property strict
 
-#include "ZmqConfig.mqh"
-#include "ProfessionalJSON.mqh"  // 使用专业级JSON构建器
+#include "ProfessionalJSON.mqh"
 
 //+------------------------------------------------------------------+
-//| 交易事件序列化器类                                                  |
+//| CTradeEventSerializer Class                                      |
 //+------------------------------------------------------------------+
 class CTradeEventSerializer
 {
+private:
+    CProfessionalJSON* m_json;
+
 public:
     //+------------------------------------------------------------------+
-    //| 构造函数                                                          |
+    //| Constructor                                                      |
     //+------------------------------------------------------------------+
-    CTradeEventSerializer() {}
-    
+    CTradeEventSerializer(void)
+    {
+        m_json = new CProfessionalJSON();
+    }
+
     //+------------------------------------------------------------------+
-    //| 析构函数                                                          |
+    //| Destructor                                                       |
     //+------------------------------------------------------------------+
-    ~CTradeEventSerializer() {}
-    
+    ~CTradeEventSerializer(void)
+    {
+        if(CheckPointer(m_json) == POINTER_DYNAMIC) delete m_json;
+    }
+
     //+------------------------------------------------------------------+
     //| 序列化交易事件                                                     |
     //+------------------------------------------------------------------+
-    string SerializeTradeEvent(const MqlTradeTransaction& trans, 
-                              const MqlTradeRequest& request,
-                              const MqlTradeResult& result)
+    string SerializeTradeEvent(const MqlTradeTransaction& trans, const MqlTradeRequest& request, const MqlTradeResult& result)
     {
-        CProfessionalJSON json; // 使用专业级构建器
-        json.StartObject();
-
-        // 事件类型 & 基础字段
-        json.Key(JSON_EVENT_TYPE)->String(GetEventType(trans.type));
-        json.Key(JSON_ORDER_ID)->Number(trans.order);
-        json.Key(JSON_POSITION_ID)->Number(trans.position);
-        json.Key(JSON_SYMBOL)->String(trans.symbol);
-        json.Key(JSON_TIMESTAMP)->Number(GetMicrosecondCount());
-
-        // 类型相关字段
+        m_json->Clear();
+        m_json->StartObject();
+        
+        // --- 基本信息 ---
+        m_json->Add("magic", (long)request.magic);
+        m_json->Add("comment", request.comment);
+        m_json->Add("timestamp_msc", (long)trans.time_msc);
+        
+        // --- 核心信息 ---
+        m_json->Add("event_type", EnumToString(trans.type));
+        m_json->Add("order_id", (long)trans.order);
+        m_json->Add("position_id", (long)trans.position);
+        m_json->Add("symbol", trans.symbol);
+        
+        // --- 价格和量 ---
+        m_json->Add("price", trans.price, 8);
+        m_json->Add("volume", trans.volume, 8);
+        
+        // --- 止损/止盈 ---
+        m_json->Add("sl", trans.price_sl, 8);
+        m_json->Add("tp", trans.price_tp, 8);
+        
+        // --- 订单/成交类型 ---
+        string action = "N/A";
         if(trans.type == TRADE_TRANSACTION_DEAL_ADD)
         {
-            json.Key(JSON_ACTION)->String(GetActionType(trans.deal_type));
-            json.Key(JSON_VOLUME)->Number(trans.volume);
-            json.Key(JSON_PRICE)->Number(trans.price, 5);
-            json.Key(JSON_SL)->Number(trans.price_sl, 5);
-            json.Key(JSON_TP)->Number(trans.price_tp, 5);
+            action = EnumToString((ENUM_DEAL_TYPE)trans.deal_type);
         }
-        else if(trans.type == TRADE_TRANSACTION_ORDER_ADD ||
-                trans.type == TRADE_TRANSACTION_ORDER_UPDATE)
+        else if(trans.type == TRADE_TRANSACTION_ORDER_ADD || trans.type == TRADE_TRANSACTION_ORDER_DELETE)
         {
-            json.Key(JSON_ACTION)->String(GetOrderActionType(trans.order_type));
-            json.Key(JSON_VOLUME)->Number(trans.volume);
-            json.Key(JSON_PRICE)->Number(trans.price, 5);
-            json.Key(JSON_SL)->Number(trans.price_sl, 5);
-            json.Key(JSON_TP)->Number(trans.price_tp, 5);
+            action = EnumToString((ENUM_ORDER_TYPE)trans.order_type);
         }
-        else if(trans.type == TRADE_TRANSACTION_ORDER_DELETE)
-        {
-            json.Key(JSON_ACTION)->String("ORDER_DELETE");
-        }
-        else if(trans.type == TRADE_TRANSACTION_POSITION)
-        {
-            json.Key(JSON_ACTION)->String("POSITION_UPDATE");
-            json.Key(JSON_VOLUME)->Number(trans.volume);
-            json.Key(JSON_PRICE)->Number(trans.price, 5);
-            json.Key(JSON_SL)->Number(trans.price_sl, 5);
-            json.Key(JSON_TP)->Number(trans.price_tp, 5);
-        }
+        m_json->Add("action", action);
 
-        // 额外信息
-        if(request.magic > 0)
-            json.Key(JSON_MAGIC)->Number(request.magic);
-        if(StringLen(request.comment) > 0)
-            json.Key(JSON_COMMENT)->String(request.comment);
-
-        json.EndObject();
-        return json.GetString();
+        m_json->EndObject();
+        return m_json->ToString();
     }
     
     //+------------------------------------------------------------------+
-    //| 序列化心跳消息                                                     |
+    //| 序列化心跳事件                                                     |
     //+------------------------------------------------------------------+
     string SerializeHeartbeat()
     {
-        CProfessionalJSON json;
-        json.StartObject();
-        json.Key("type")->String(MSG_HEARTBEAT);
-        json.Key("timestamp")->Number(GetMicrosecondCount());
-        json.Key("account")->Number(AccountInfoInteger(ACCOUNT_LOGIN));
-        json.EndObject();
-        return json.GetString();
-    }
-    
-private:
-    //+------------------------------------------------------------------+
-    //| 获取事件类型字符串                                                 |
-    //+------------------------------------------------------------------+
-    string GetEventType(ENUM_TRADE_TRANSACTION_TYPE type)
-    {
-        switch(type)
-        {
-            case TRADE_TRANSACTION_DEAL_ADD:      return EVENT_DEAL_ADD;
-            case TRADE_TRANSACTION_ORDER_ADD:     return EVENT_ORDER_ADD;
-            case TRADE_TRANSACTION_ORDER_DELETE:  return EVENT_ORDER_DELETE;
-            case TRADE_TRANSACTION_ORDER_UPDATE:  return EVENT_ORDER_UPDATE;
-            case TRADE_TRANSACTION_POSITION:      return EVENT_POSITION_UPDATE;
-            default:                              return "UNKNOWN";
-        }
-    }
-    
-    //+------------------------------------------------------------------+
-    //| 获取交易动作类型                                                   |
-    //+------------------------------------------------------------------+
-    string GetActionType(ENUM_DEAL_TYPE type)
-    {
-        switch(type)
-        {
-            case DEAL_TYPE_BUY:   return "BUY";
-            case DEAL_TYPE_SELL:  return "SELL";
-            default:              return "UNKNOWN";
-        }
-    }
-    
-    //+------------------------------------------------------------------+
-    //| 获取订单动作类型                                                   |
-    //+------------------------------------------------------------------+
-    string GetOrderActionType(ENUM_ORDER_TYPE type)
-    {
-        switch(type)
-        {
-            case ORDER_TYPE_BUY:              return "BUY";
-            case ORDER_TYPE_SELL:             return "SELL";
-            case ORDER_TYPE_BUY_LIMIT:        return "BUY_LIMIT";
-            case ORDER_TYPE_SELL_LIMIT:       return "SELL_LIMIT";
-            case ORDER_TYPE_BUY_STOP:         return "BUY_STOP";
-            case ORDER_TYPE_SELL_STOP:        return "SELL_STOP";
-            case ORDER_TYPE_BUY_STOP_LIMIT:   return "BUY_STOP_LIMIT";
-            case ORDER_TYPE_SELL_STOP_LIMIT:  return "SELL_STOP_LIMIT";
-            default:                          return "UNKNOWN";
-        }
+        m_json->Clear();
+        m_json->StartObject();
+        
+        m_json->Add("type", "HEARTBEAT");
+        m_json->Add("account", (long)AccountInfoInteger(ACCOUNT_LOGIN));
+        m_json->Add("timestamp", (long)TimeCurrent());
+        
+        m_json->EndObject();
+        return m_json->ToString();
     }
 }; 

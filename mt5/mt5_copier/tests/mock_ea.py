@@ -25,12 +25,10 @@ import random
 import argparse
 from datetime import datetime
 
-# ZMQ配置 (must match the test harness)
-ZMQ_SYNC_URI = "ipc://mt5_sync.ipc"
-ZMQ_BUS_URI = "ipc://mt5_trade_bus.ipc"
-MSG_SYNC_REQUEST = "READY?"
-MSG_SYNC_RESPONSE = "ACK"
-MSG_HEARTBEAT = "HEARTBEAT"
+# 从新的配置文件中导入所有ZMQ设置
+from mt5_copier.python.config.settings import (
+    ZMQ_SYNC_URI, ZMQ_BUS_URI, MSG_SYNC_REQUEST, MSG_SYNC_RESPONSE, MSG_HEARTBEAT
+)
 
 class MockEventGenerator:
     """Generates sequences of realistic, stateful trade events."""
