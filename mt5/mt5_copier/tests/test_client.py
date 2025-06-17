@@ -28,7 +28,7 @@ def main():
     poller.register(req_socket, zmq.POLLIN)
     
     ack_received = False
-    socks = dict(poller.poll(5000)) # 5-second timeout
+    socks = dict(poller.poll(150000)) # 5-second timeout
     if req_socket in socks and socks[req_socket] == zmq.POLLIN:
         message = req_socket.recv_string()
         if message == "ACK":
