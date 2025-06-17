@@ -14,6 +14,7 @@ from core.config_manager import ConfigManager
 from core.account_manager import AccountManager
 from core.trade_engine import TradeEngine
 from core.zmq_listener import ZmqListener
+from core.connection_manager import ConnectionManager
 from config import settings
 
 def setup_logging():
@@ -57,17 +58,23 @@ def main():
         sys.exit(1)
     print("[DEBUG] 配置管理器初始化成功。")
 
-    # 2. 初始化账户管理器
+    # 2. 初始化连接管理器，并尝试连接所有跟单账户
+    connection_manager = ConnectionManager(config_manager)
+    for acc in config_manager.get_follower_accounts():
+        connection_manager.connect_account(acc["name"])
+    connection_manager.start_monitoring()
+
+    # 3. 初始化账户管理器
     print("[DEBUG] 正在初始化账户管理器...")
     account_manager = AccountManager(config_manager)
     print("[DEBUG] 账户管理器初始化成功。")
 
-    # 3. 初始化交易引擎
+    # 4. 初始化交易引擎
     print("[DEBUG] 正在初始化交易引擎...")
     trade_engine = TradeEngine(config_manager, account_manager)
     print("[DEBUG] 交易引擎初始化成功。")
 
-    # 4. 初始化并启动 ZMQ 监听器
+    # 5. 初始化并启动 ZMQ 监听器
     print("[DEBUG] 正在初始化 ZMQ 监听器...")
     zmq_listener = ZmqListener(
         config_manager=config_manager,
