@@ -44,10 +44,11 @@ class AccountManager:
         with self.connection_locks[account_name]:
             logger.debug(f"为 {account_name} 执行交易: {request}")
             try:
-                # 初始化与特定 MT5 终端的连接
-                if not mt5.initialize(path=config['mt5_path'], 
-                                      login=config['login'], 
-                                      password=config['password'], 
+                # Only attach to a manually started terminal. We omit the
+                # path parameter so MetaTrader5 does not attempt to start a
+                # new terminal process.
+                if not mt5.initialize(login=config['login'],
+                                      password=config['password'],
                                       server=config['server']):
                     error = mt5.last_error()
                     logger.error(f"为 {account_name} 初始化 MT5 失败: {error}")
@@ -109,6 +110,37 @@ class AccountManager:
         
         logger.debug(f"执行池完成处理 {len(results)} 笔交易。")
         return results
+
+    def get_account_info(self, account_name: str):
+        """Return MetaTrader5 account info for the follower account."""
+        config = self.config_manager.get_follower_config(account_name)
+        if not config or not config.get("enabled", False):
+            return None
+
+        with self.connection_locks[account_name]:
+            if not mt5.initialize(login=config["login"],
+                                  password=config["password"],
+                                  server=config["server"]):
+                logger.error(
+                    f"为 {account_name} 初始化 MT5 失败以获取账户信息: {mt5.last_error()}"
+                )
+                mt5.shutdown()
+                return None
+            info = mt5.account_info()
+            mt5.shutdown()
+            return info
+
+    def normalize_volume(self, account_name: str, symbol: str, volume: float) -> float:
+        """Normalize lot size according to symbol settings."""
+        symbol_info = mt5.symbol_info(symbol)
+        if symbol_info is None:
+            return volume
+
+        volume = max(symbol_info.volume_min, min(volume, symbol_info.volume_max))
+        step = symbol_info.volume_step
+        if step > 0:
+            volume = round(volume / step) * step
+        return volume
 
     def shutdown(self):
         # 优雅地关闭线程池执行器。
