@@ -136,3 +136,10 @@ pip install pydantic
 - [ ] 日志系统优化
 - [ ] 单元测试和集成测试
 - [ ] 性能优化和压力测试 
+## Suggested Next Steps
+
+- Configure the new GitHub Actions workflow to automatically run the test suite on every push.
+- Store account credentials using environment variables instead of plain text.
+- Extend the GUI to control individual follower accounts and display connection status.
+
+

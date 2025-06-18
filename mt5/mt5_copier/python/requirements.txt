@@ -1,3 +1,4 @@
 pyzmq
 pydantic
-MetaTrader5 
+MetaTrader5
+PyQt5
