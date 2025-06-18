@@ -1,4 +1,6 @@
 pyzmq
 pydantic
-MetaTrader5
 PyQt5
+flake8
+MetaTrader5
+
