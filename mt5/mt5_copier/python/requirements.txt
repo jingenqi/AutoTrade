@@ -2,3 +2,5 @@ pyzmq
 pydantic
 PyQt5
 flake8
+MetaTrader5
+
