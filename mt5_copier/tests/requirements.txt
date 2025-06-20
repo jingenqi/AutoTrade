@@ -1,0 +1,7 @@
+pyzmq
+pydantic
+rich
+PyQt5
+pytest
+pytest-qt
+pytest-mock 

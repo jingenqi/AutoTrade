@@ -1,0 +1,30 @@
+{
+    "master_account": {
+        "name": "Master_Account",
+        "enabled": true,
+        "login": 6124886,
+        "password": "LDEpmr8#",
+        "server": "ActivTrades-Server"
+    },
+    "follower_accounts": [
+        {
+            "name": "Follower1_Regular",
+            "login": 6115797,
+            "password": "QQXozd5&",
+            "server": "ActivTrades-Server",
+            "mt5_path": "D:/metatrader5/v2-mt5/terminal64.exe",
+            "strategy": "regular",
+            "lot_mode": "multiplier",
+            "lot_value": 1.0,
+            "copy_sl_tp": true,
+            "copy_reversed_sl_tp": true,
+            "copy_pending": true,
+            "max_slippage_pips": 3,
+            "max_latency_ms": 500,
+            "enabled": true,
+            "symbol_mapping": {
+                "GBPUSD": "GBPUSD-sb"
+            }
+        }
+    ]
+}
