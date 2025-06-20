@@ -1,0 +1,35 @@
+{
+    "master_account": {
+        "name": "Master_Account",
+        "enabled": true,
+        "login": 6124886,
+        "password": "LDEpmr8#",
+        "server": "ActivTrades-Server",
+        "strategy": "regular",
+        "lot_mode": "multiplier",
+        "lot_value": 1.0,
+        "copy_sl_tp": true,
+        "copy_reversed_sl_tp": false,
+        "copy_pending": true,
+        "max_slippage_pips": 3,
+        "max_latency_ms": 500
+    },
+    "follower_accounts": [
+        {
+            "name": "Test_Regular",
+            "enabled": true,
+            "mt5_path": "C:\\Program Files\\MetaTrader 5\\terminal64.exe",
+            "login": 12345678,
+            "password": "test_password",
+            "server": "Test-Server",
+            "strategy": "regular",
+            "lot_mode": "multiplier",
+            "lot_value": 1.0,
+            "copy_sl_tp": true,
+            "copy_reversed_sl_tp": false,
+            "copy_pending": true,
+            "max_slippage_pips": 3,
+            "max_latency_ms": 500
+        }
+    ]
+}

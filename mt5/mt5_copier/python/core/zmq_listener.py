@@ -4,10 +4,18 @@ from typing import Callable, Optional, Dict, Any
 import logging
 import time
 import json
+import os
 
-from config import settings
+# Import connection settings - try to use the settings module or fall back to defaults
+try:
+    from config.settings import ZMQ_SYNC_URI, ZMQ_PUB_URI
+except ImportError:
+    # Default values if settings module is not available
+    ZMQ_SYNC_URI = "tcp://localhost:5555"
+    ZMQ_PUB_URI = "tcp://localhost:5556"
 from core.config_manager import ConfigManager
 from core.events import create_event_from_dict, HeartbeatEvent
+from core.error_handler import CircuitBreaker
 
 # 设置日志
 logger = logging.getLogger("TradeCopier.ZmqListener")
@@ -51,6 +59,9 @@ class ZmqListener:
 
         # 心跳配置
         self.heartbeat_interval = 5  # 秒
+        
+        # 添加断路器以防止故障扩散
+        self.circuit_breaker = CircuitBreaker(failure_threshold=5, recovery_timeout=60.0)
         self.last_heartbeat_time = time.time()
 
         logger.debug("ZmqListener 已初始化。")
@@ -170,6 +181,14 @@ class ZmqListener:
         # 这个函数假定 self.sync_socket 已经连接。
         logger.info(f"正在与 EA 在 {self.sync_uri} 上执行状态握手...")
         try:
+            # 记录上次握手时间，避免频繁握手
+            current_time = time.time()
+            if hasattr(self, '_last_handshake_time') and (current_time - self._last_handshake_time < 60):
+                logger.debug(f"距离上次握手仅过去了 {current_time - self._last_handshake_time:.1f} 秒，跳过握手。")
+                return
+                
+            self._last_handshake_time = current_time
+            
             # 1. 发送 SYNC 请求
             self.sync_socket.send_string("SYNC")
             logger.debug("已发送 SYNC 请求。")
@@ -266,17 +285,3 @@ class ZmqListener:
     def _listen_for_events(self):
         # 持续监听 ZeroMQ 事件总线以获取事件。此函数在当前实现中可能未被直接使用，其逻辑已合并到 _receive_events。保留此函数是为了可能的未来扩展或作为参考。
         pass # 逻辑已合并到 _receive_events
-
-    def stop(self):
-        # 停止监听器线程并等待其终止。
-        if not self.running:
-            logger.warning("ZMQ 监听器未在运行。")
-            return
-        logger.info("正在停止 ZMQ 监听器...")
-        self.running = False
-        if self.listener_thread:
-            self.listener_thread.join(timeout=5) # 等待线程终止
-            if self.listener_thread.is_alive():
-                logger.warning("ZMQ 监听器线程未能及时终止。")
-        self._close_sockets()
-        logger.info("ZMQ 监听器已停止。") 

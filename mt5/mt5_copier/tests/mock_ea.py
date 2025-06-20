@@ -1,9 +1,4 @@
 #!/usr/bin/env python3
-# Add project root to sys.path to allow imports from parent directories
-import sys
-import os
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
-
 """
 Mock MQL5 Expert Advisor (Comprehensive Scenario-Based)
 -------------------------------------------------------
@@ -26,7 +21,7 @@ import argparse
 from datetime import datetime
 
 # 从新的配置文件中导入所有ZMQ设置
-from mt5_copier.python.config.settings import (
+from python.config.settings import (
     ZMQ_SYNC_URI, ZMQ_BUS_URI, MSG_SYNC_REQUEST, MSG_SYNC_RESPONSE, MSG_HEARTBEAT
 )
 

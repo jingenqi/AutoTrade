@@ -1,9 +1,3 @@
-#!/usr/bin/env python3
-# Add project root to sys.path to allow imports from parent directories
-import sys
-import os
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
-
 """
 MT5-ZMQ EA高级测试与验证脚本
 --------------------------------
@@ -31,11 +25,14 @@ from rich.table import Table
 from rich.live import Live
 
 # 从核心模块导入共享的数据契约
-from mt5_copier.python.core.events import TradeEvent, HeartbeatEvent
+from python.core.events import create_event_from_dict, HeartbeatEvent
 # 从新的配置文件中导入所有ZMQ设置
-from mt5_copier.python.config.settings import (
-    ZMQ_SYNC_URI, ZMQ_BUS_URI, MSG_SYNC_REQUEST, MSG_SYNC_RESPONSE, MSG_HEARTBEAT
+from python.config.settings import (
+    ZMQ_SYNC_URI, ZMQ_BUS_URI, MSG_SYNC_REQUEST, MSG_SYNC_RESPONSE
 )
+
+# 心跳常量（如果settings.py中没有定义）
+MSG_HEARTBEAT = "HEARTBEAT"
 
 # ZMQ配置 (已移至 mt5_copier/python/config/settings.py)
 
@@ -117,17 +114,16 @@ def run_ea_test():
                     data = json.loads(raw_message)
                     
                     # 检查是否为心跳
-                    if data.get("type") == MSG_HEARTBEAT:
+                    if data.get("event_type") == MSG_HEARTBEAT:
                         stats.heartbeats += 1
                         # Validate heartbeat against its own model
-                        hb_event = HeartbeatEvent.model_validate(data)
+                        hb_event = HeartbeatEvent(**data)
                         stats.events_passed += 1
                         
                         hb_table = Table(show_header=False, box=None)
                         hb_table.add_column(style="magenta")
                         hb_table.add_column()
-                        hb_table.add_row("type:", hb_event.type)
-                        hb_table.add_row("account:", str(hb_event.account))
+                        hb_table.add_row("event_type:", hb_event.event_type)
                         hb_table.add_row("timestamp:", str(hb_event.timestamp))
                         
                         console.print(Panel(
@@ -138,14 +134,14 @@ def run_ea_test():
                         continue # Go to next message
                         
                     # 验证交易事件
-                    event = TradeEvent.model_validate(data)
+                    event = create_event_from_dict(data)
                     stats.events_passed += 1
                     
                     # 成功: 打印绿色面板和事件详情
                     table = Table(show_header=False, box=None)
                     table.add_column(style="magenta")
                     table.add_column()
-                    for key, value in event.model_dump().items():
+                    for key, value in data.items():
                         table.add_row(f"{key}:", str(value))
                         
                     console.print(Panel(
@@ -165,7 +161,7 @@ def run_ea_test():
                     stats.events_failed += 1
                     console.print(Panel(
                         f"[bold]Invalid Data Structure. Errors:[/bold]\n[yellow]{e}[/yellow]\n\n[bold]Raw Message:[/bold]\n{raw_message}",
-                        title=f"{panel_title} [red]FAIL: Pydantic Validation[/red]",
+                        title=f"{panel_title} [red]FAIL: Event Creation/Validation[/red]",
                         border_style="red"
                     ))
             

@@ -1,0 +1,258 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+# MT5 Trade Copier System - Cursor AI Rules
+
+## Project Overview
+This is a high-performance, event-driven MT5 (MetaTrader 5) trade copying system that enables real-time synchronization of trades between a master account and multiple follower accounts. The system uses ZeroMQ for ultra-low latency communication and supports both regular and reverse copying strategies.
+
+## Architecture Guidelines
+
+### Core Principles
+1. **Event-Driven Architecture**: All trade events flow from MT5 EA → ZeroMQ → Python Controller → Follower MT5s
+2. **Millisecond Latency**: Prioritize performance - use IPC over TCP when possible, parallel execution for multiple accounts
+3. **Thread Safety**: All shared resources must be protected with locks (especially trade_map and config access)
+4. **Resilience**: Handle all failure modes gracefully - connection losses, trade failures, MT5 API errors
+
+### Key Components
+- **MQL5 EA (Master)**: Captures OnTradeTransaction events, publishes via ZeroMQ PUB socket
+- **Python Controller**: Central hub - subscribes to events, applies trading logic, executes on followers
+- **ZeroMQ Communication**: PUB/SUB for events, REQ/REP for handshake synchronization
+- **MT5 Python API**: Official MetaTrader5 library for follower account control
+
+## Code Style and Conventions
+
+### Python Code Style
+- Use type hints for all function parameters and returns
+- Follow PEP 8 with 4-space indentation
+- Maximum line length: 120 characters
+- Use descriptive variable names (not single letters except for loops)
+- All classes should have docstrings describing their purpose
+- Use logging instead of print statements
+
+### Error Handling
+- Always wrap MT5 API calls in try-except blocks
+- Log errors with appropriate severity levels (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+- Never silently fail - at minimum log the error
+- For critical errors, attempt recovery before failing
+
+### Threading and Concurrency
+- Use ThreadPoolExecutor for parallel trade execution
+- Always use context managers (with statements) for locks
+- Prefer RLock over Lock for reentrant code
+- GUI operations must only happen in the main thread
+
+## Development Guidelines
+
+### When Working with MT5 API
+```python
+# Always follow this pattern:
+if not mt5.initialize(login=config['login'], password=config['password'], server=config['server']):
+    error = mt5.last_error()
+    logger.error(f"MT5 initialization failed: {error}")
+    mt5.shutdown()
+    return None
+
+# Always shutdown after operations
+mt5.shutdown()
+```
+
+### Trade Execution Pattern
+```python
+# Build requests dict → Execute in parallel → Update state → Save to disk
+trade_requests = self._build_trade_requests(event)
+results = self.account_manager.execute_trades_parallel(trade_requests)
+with self.lock:
+    self.position_map[master_id] = {name: result for name, result in results.items()}
+    self._save_state_to_disk()
+```
+
+### ZeroMQ Communication
+- Always implement handshake before starting main communication
+- Use multipart messages: [topic, payload]
+- Handle reconnection logic in listener loop
+- Monitor heartbeats to detect EA disconnection
+
+## Common Issues and Solutions
+
+### Issue: "Slow Subscriber Syndrome"
+**Solution**: Implement REQ/REP handshake before PUB/SUB to ensure no initial messages are lost
+
+### Issue: MT5 API single connection limitation
+**Solution**: Use connection pooling with locks, connect → execute → disconnect pattern
+
+### Issue: Partial fills creating multiple DEAL_ADD events
+**Solution**: Track cumulative volume by order_id, only copy the delta
+
+### Issue: State loss on controller restart
+**Solution**: Persist position_map and pending_order_map to disk, reload on startup
+
+## Testing Guidelines
+
+### Unit Tests
+- Mock all external dependencies (MT5 API, ZeroMQ)
+- Test each component in isolation
+- Focus on trade logic correctness
+
+### Integration Tests
+- Use test_system.py for end-to-end validation
+- Verify event flow from EA to follower execution
+- Test error scenarios (connection loss, trade rejection)
+
+## Configuration Management
+
+### config.json Structure
+```json
+{
+    "follower_accounts": [{
+        "name": "Follower1_Regular",
+        "enabled": true,
+        "login": 12345678,
+        "password": "password",
+        "server": "broker-server",
+        "strategy": "regular|reverse",
+        "lot_mode": "multiplier|fixed|risk_percentage",
+        "lot_value": 1.0,
+        "copy_sl_tp": true,
+        "max_slippage_pips": 3
+    }]
+}
+```
+
+### Hot Reload Support
+- ConfigManager should support reload_config() without restart
+- GUI changes should immediately update config file
+- Use RLock for thread-safe config access
+
+## Performance Optimization
+
+### Latency Targets
+- EA → Python: < 1ms (using IPC)
+- Python processing: < 2ms
+- Parallel execution to all followers: < 5ms total
+- End-to-end: < 10ms
+
+### Optimization Techniques
+1. Use IPC instead of TCP for local communication
+2. Parallel execution with ThreadPoolExecutor
+3. Minimize MT5 API calls (batch where possible)
+4. Pre-compile trade request templates
+5. Use efficient data structures (dicts for O(1) lookups)
+
+## Security Considerations
+
+### Credential Management
+- Never log passwords or sensitive data
+- Consider encrypting passwords in config.json
+- Use environment variables for production credentials
+
+### Trade Validation
+- Validate all incoming events with Pydantic models
+- Check slippage limits before execution
+- Implement maximum position size limits
+- Validate symbol availability on follower accounts
+
+## GUI Development (PyQt5)
+
+### Best Practices
+- Use Worker-Object pattern with QThread
+- Never block the main thread
+- Emit signals for all UI updates
+- Implement graceful shutdown with proper cleanup
+
+### Signal/Slot Patterns
+```python
+# Worker → GUI
+self.log_received.connect(self.update_log_widget)
+self.position_updated.connect(self.refresh_position_table)
+
+# GUI → Worker  
+self.start_button.clicked.connect(self.worker.start_trading)
+```
+
+## Debugging Tips
+
+### Logging Setup
+- Use structured logging with JSON formatter
+- Include correlation IDs for trade tracking
+- Log all state transitions
+- Enable DEBUG level for development
+
+### Common Debug Commands
+```python
+# Check trade mappings
+logger.debug(f"Current position_map: {self.position_map}")
+
+# Verify event reception
+logger.debug(f"Received event: {json.dumps(event_dict, indent=2)}")
+
+# Monitor execution timing
+start_time = time.time()
+# ... operation ...
+logger.info(f"Operation took {time.time() - start_time:.3f}s")
+```
+
+## Production Deployment
+
+### Pre-deployment Checklist
+- [ ] All follower MT5 terminals running in /portable mode
+- [ ] ZeroMQ DLLs installed in MT5 Libraries folder
+- [ ] Python dependencies installed (requirements.txt)
+- [ ] Config.json properly configured with real credentials
+- [ ] Logging configured with appropriate rotation
+- [ ] Error alerting mechanism in place
+
+### Monitoring
+- Track average latency per trade
+- Monitor success/failure rates
+- Alert on heartbeat timeout
+- Log all retcode errors from MT5
+
+## Future Enhancements to Consider
+
+1. **Advanced Risk Management**
+   - Portfolio-level risk limits
+   - Correlation-based position sizing
+   - Dynamic lot calculation based on drawdown
+
+2. **Enhanced Strategies**
+   - Partial copying (copy only certain symbols)
+   - Time-based filters
+   - Conditional copying based on market conditions
+
+3. **Scalability**
+   - Redis for state management
+   - Multiple EA support
+   - Cloud deployment options
+
+4. **Analytics**
+   - Real-time performance dashboard
+   - Trade analysis and reporting
+   - Slippage analytics
+
+## Important Warnings
+
+⚠️ **NEVER** call mt5.initialize() with path parameter in production - let users start terminals manually
+⚠️ **ALWAYS** validate trade events before execution - malformed data can cause significant losses
+⚠️ **NEVER** store credentials in version control
+⚠️ **ALWAYS** test thoroughly in demo accounts before live trading
+⚠️ **MONITOR** for orphaned positions after controller restart
+
+## Code Review Focus Areas
+
+When reviewing code changes, pay special attention to:
+1. Thread safety of shared resources
+2. Proper error handling and recovery
+3. Resource cleanup (sockets, MT5 connections)
+4. State persistence and recovery logic
+5. Trade execution accuracy (especially for reverse copying)
+
+## Contact and Resources
+
+- MT5 Python API Docs: https://www.mql5.com/en/docs/python_metatrader5
+- ZeroMQ Guide: http://zguide.zeromq.org/
+- PyQt5 Documentation: https://doc.qt.io/qtforpython/
+
+- Project Structure: Follow the existing module organization in /python/core/

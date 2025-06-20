@@ -115,6 +115,15 @@ class DealAddEvent(BaseEvent):
     
     def __post_init__(self):
         self.event_type = "DEAL_ADD"
+        # 添加类型转换和验证
+        for field_name, field_type in self.__annotations__.items():
+            if field_name == 'event_type': continue
+            try:
+                current_value = getattr(self, field_name)
+                if not isinstance(current_value, field_type):
+                    setattr(self, field_name, field_type(current_value))
+            except (ValueError, TypeError) as e:
+                raise TypeError(f"Field '{field_name}' a '{type(current_value).__name__}' a un type invalide: {e}")
 
 @dataclass
 class PositionModifyEvent(BaseEvent):
