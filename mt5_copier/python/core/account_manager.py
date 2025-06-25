@@ -1,252 +1,470 @@
 import MetaTrader5 as mt5
 import logging
-from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, Any, Optional, Callable
-from threading import RLock
 import time
+import multiprocessing
+from typing import Dict, Any, Optional, List, Callable
+import uuid
+import concurrent.futures
+import threading
+import queue
 
 from .config_manager import ConfigManager
+from .worker_process import WorkerProcess
+from gui.signals import GuiConnectionSignal
 
-logger = logging.getLogger("TradeCopier.AccountManager")
+logger = logging.getLogger(f"TradeCopier.{__name__}")
 
 class AccountManager:
     """
-    管理多个跟单MT5账户的连接和交易执行。
-    采用安全的"即用即连"模式，并在每次连接后验证身份，以防止终端劫持。
+    通过多进程模型管理多个跟单MT5账户的连接和交易执行。
+    主进程不直接与MT5交互，而是通过IPC将任务分发给专用的工作进程。
     """
     def __init__(self, config_manager: ConfigManager):
+        """
+        初始化账户管理器。
+        """
         self.config_manager = config_manager
-        self.executor = ThreadPoolExecutor(max_workers=10, thread_name_prefix='MT5Executor')
-        self.executor_lock = RLock()
-        self.lock = RLock()
-        self._trade_callback: Optional[Callable[[str, Dict], None]] = None
-        self._is_shutdown = False
+        self.follower_configs = self.config_manager.get_enabled_follower_configs()
+        self.lock = threading.RLock()
+        self.worker_processes: Dict[str, multiprocessing.Process] = {}
+        self.task_queues: Dict[str, multiprocessing.Queue] = {}
+        self.result_queue = multiprocessing.Queue()
+        self.stop_event = threading.Event()
+        self.result_listener_thread = None
+        self.is_running = False
 
-        master_account_config = self.config_manager.get_master_account()
-        self.master_login = master_account_config.get("login") if master_account_config else None
+        self._pending_results: Dict[str, Any] = {}
+        self._pending_result_events: Dict[str, threading.Event] = {}
+        self._trade_callback: Optional[Callable[[Dict], None]] = None
+
+        # 用于GUI更新的信号
+        self.connection_signal = GuiConnectionSignal()
         
-        if self.master_login:
-            logger.info(f"已设置主账户登录号: {self.master_login}，将用于防止终端劫持。")
-        else:
-            logger.warning("配置文件中未找到主账户信息，无法执行终端劫持检查。")
+        # PnL 更新
+        self.pnl_update_thread = None
+        self.pnl_update_interval = 5 # seconds
 
-    def _ensure_executor_running(self):
-        """确保线程池执行器正在运行，如果已关闭则重新创建"""
-        with self.executor_lock:
-            if self._is_shutdown or self.executor._shutdown:
-                logger.info("线程池已关闭，正在重新初始化...")
-                self.executor = ThreadPoolExecutor(max_workers=10, thread_name_prefix='MT5Executor')
-                self._is_shutdown = False
-                logger.info("线程池已重新初始化")
+    def start(self, trade_callback: Callable[[Dict], None]):
+        """启动账户管理器，创建并启动所有工作进程。"""
+        if self.is_running:
+            logger.warning("AccountManager 已经启动。")
+            return
 
-    def _get_connection(self, account_name: str) -> Optional[mt5]:
-        """
-        通过"探查-验证"模式安全地获取MT5连接，绝不传递登录凭证。
-        此方法假设用户已经手动启动了所有需要的MT5终端，只负责连接已运行的终端。
-        会严格验证连接账号，确保不会连接到主账户。
-        """
-        acc_config = self.config_manager.get_follower_account(account_name)
-        if not acc_config or not acc_config.get("enabled", False):
-            return None
+        logger.info("正在启动 AccountManager 及所有工作进程...")
+        self._trade_callback = trade_callback
+        self.is_running = True
+        self.stop_event.clear()
 
-        expected_login = acc_config.get("login")
-        if not expected_login:
-            logger.error(f"账户 '{account_name}' 在配置中缺少登录号。")
-            return None
+        if not self.follower_configs:
+            logger.warning("没有已启用的跟单账户，AccountManager 未启动任何工作进程。")
+            return
 
-        # 获取主账户登录号，用于确保不会连接到主账户
-        if self.master_login and expected_login == self.master_login:
-            logger.error(f"试图将主账户 {self.master_login} 作为跟单账户 '{account_name}' 连接，这是不允许的。")
-            return None
+        # 启动结果监听线程
+        self.result_listener_thread = threading.Thread(target=self._listen_for_results, daemon=True)
+        self.result_listener_thread.start()
+        logger.info("结果监听线程已启动。")
+        
+        successful_workers = []
+        failed_workers = []
 
-        # 检查新的和旧的路径配置键，并优先使用新的
-        terminal_path = acc_config.get("terminal_path") or acc_config.get("mt5_path")
-        if acc_config.get("mt5_path"):
-            logger.warning(f"配置键 'mt5_path' 已弃用，请在配置文件中更新为 'terminal_path' 以保持兼容性。")
-
-        # 优先策略：如果配置了终端路径，则使用该路径进行精确连接
-        if terminal_path:
-            logger.debug(f"尝试使用指定路径连接到账户 '{account_name}': {terminal_path}")
-            # 增加重试机制，因为即使有路径，第一次连接也可能因为时机问题失败
-            for i in range(3): # 尝试3次
-                if mt5.initialize(path=terminal_path):
-                    account_info = mt5.account_info()
-                    if account_info and account_info.login == expected_login:
-                        logger.info(f"成功通过路径连接到跟单账户 '{account_name}' ({expected_login})。")
-                        return mt5
-                    else:
-                        actual_login = account_info.login if account_info else "N/A"
-                        logger.warning(f"通过路径 '{terminal_path}' 连接到了错误的账户。预期: {expected_login}, 实际: {actual_login}。正在关闭连接...")
-                        mt5.shutdown()
-                else:
-                    error = mt5.last_error()
-                    logger.warning(f"使用路径 '{terminal_path}' 初始化MT5失败 (尝试 {i+1}/3)。错误: {error}")
-
-                if i < 2:
-                    time.sleep(0.5) # 重试前短暂等待
-            
-            logger.error(f"多次尝试后仍无法通过路径 '{terminal_path}' 连接到正确的账户 {expected_login}。")
-            logger.error("请确认：1. 路径是否正确。2. 对应的MT5终端已启动并登录。3. 没有以管理员权限运行MT5而普通权限运行本程序。")
-            return None
-
-        # 备用策略：如果未配置路径，则使用旧的"探查-验证"模式
-        logger.warning(f"账户 '{account_name}' 未配置 'terminal_path'。将尝试自动发现终端，此方式连接不稳定，强烈建议进行配置。")
-        server = acc_config.get("server", "未知")
-        max_attempts = 5
-        for i in range(max_attempts):
+        for name, config in self.follower_configs.items():
             try:
-                if mt5.initialize():
-                    account_info = mt5.account_info()
-                    
-                    if account_info and self.master_login and account_info.login == self.master_login:
-                        logger.warning(f"连接尝试 {i+1}/{max_attempts}: 错误连接到主账户 ({self.master_login})，而不是跟单账户 '{account_name}' ({expected_login})。正在断开重试...")
-                        mt5.shutdown()
-                        time.sleep(1.0)
-                        continue
-                    
-                    if account_info and account_info.login == expected_login:
-                        logger.info(f"成功发现并连接到跟单账户 '{account_name}' ({expected_login})。")
-                        return mt5
-    
-                    actual_login = account_info.login if account_info else "N/A"
-                    logger.debug(f"连接尝试 {i+1}/{max_attempts}: 连接到非预期的终端 ({actual_login}), 需要 ({expected_login})。正在断开重试...")
-                    mt5.shutdown()
-                else:
-                    logger.warning(f"连接尝试 {i+1}/{max_attempts}: mt5.initialize() 失败。")
-    
-                wait_time = 0.5 + (i * 0.2)
-                if i < max_attempts - 1:
-                    time.sleep(wait_time)
-            except Exception as e:
-                logger.error(f"连接尝试 {i+1}/{max_attempts} 发生异常: {e}")
+                task_queue = multiprocessing.Queue()
+                
+                worker = WorkerProcess(
+                    account_config=config,
+                    task_queue=task_queue,
+                    result_queue=self.result_queue,
+                )
+                
+                worker.start()
+                
+                logger.info(f"等待工作进程 '{name}' 初始化...")
                 try:
-                    mt5.shutdown()
-                except Exception:
-                    pass
-                time.sleep(1.0)
+                    # 等待来自工作进程的'initialized'信号
+                    init_signal = self.result_queue.get(timeout=15)
+                    if init_signal.get('status') == 'initialized' and init_signal.get('worker_name') == name:
+                        self.worker_processes[name] = worker
+                        self.task_queues[name] = task_queue
+                        
+                        account_info = init_signal.get('account_info', {})
+                        # 立刻更新UI
+                        self.connection_signal.update_account_status.emit({
+                            'name': name, 'status': 'connected', **account_info
+                        })
+                        
+                        successful_workers.append(name)
+                        logger.info(f"✓ 工作进程 '{name}' 启动成功")
+                    else:
+                       logger.error(f"✗ 工作进程 '{name}' 初始化信号不正确: {init_signal}")
+                       worker.terminate()
+                       failed_workers.append((name, "初始化信号错误"))
+                except queue.Empty:
+                    logger.error(f"✗ 工作进程 '{name}' 在15秒内无响应，启动失败。")
+                    worker.terminate()
+                    failed_workers.append((name, "初始化超时"))
+                    
+            except Exception as e:
+                logger.error(f"创建工作进程 '{name}' 时发生错误: {e}", exc_info=True)
+                failed_workers.append((name, str(e)))
 
-        logger.error(f"未能找到已启动的 MT5 终端用于跟单账户 '{account_name}' (登录号: {expected_login}, 服务器: {server})。")
-        logger.error(f"请确保该账户的 MT5 终端已手动启动并正确登录。")
+        # 只有在有工作进程成功启动时才启动更新器
+        if successful_workers:
+            self.pnl_update_thread = threading.Thread(target=self._account_info_updater, daemon=True, name="AccountInfoUpdater")
+            self.pnl_update_thread.start()
+        
+        logger.info(f"AccountManager 启动完成: {len(successful_workers)} 个成功, {len(failed_workers)} 个失败")
+        if failed_workers:
+            logger.error("以下账户未能成功启动工作进程:")
+            for name, reason in failed_workers:
+                logger.error(f"  - {name}: {reason}")
+        
+        return successful_workers, failed_workers
+
+    def _listen_for_results(self):
+        """
+        在一个专用线程中监听来自工作进程的结果，并将它们分派出去。
+        """
+        logger.info("结果监听循环开始...")
+        while not self.stop_event.is_set():
+            try:
+                result = self.result_queue.get(timeout=0.1)
+                correlation_id = result.get("correlation_id")
+                if correlation_id:
+                    with self.lock:
+                        # If there is a trade callback, and it's not a direct request-response, use it
+                        if self._trade_callback and result.get("type") == "trade_result":
+                             self._trade_callback(result)
+                        # 处理来自worker的账户信息更新
+                        elif result.get("type") == "account_info_update":
+                            account_name = result.get("worker_name")
+                            if account_name in self.worker_processes:
+                                self.connection_signal.update_account_status.emit({
+                                    'name': account_name, 'status': 'connected', **result.get('payload', {})
+                                })
+                        else:
+                            self._pending_results[correlation_id] = result
+                            event = self._pending_result_events.get(correlation_id)
+                            if event:
+                                event.set()
+                else:
+                    logger.warning(f"收到了没有 correlation_id 的结果: {result}")
+            except queue.Empty:
+                continue
+            except Exception as e:
+                logger.error(f"结果监听线程出现意外错误: {e}", exc_info=True)
+        logger.info("结果监听循环已停止。")
+
+    def stop(self):
+        """关闭所有工作进程和管理器。"""
+        if not self.is_running:
+            return
+            
+        logger.info("正在关闭 AccountManager 及所有工作进程...")
+        self.stop_event.set()
+
+        if self.pnl_update_thread and self.pnl_update_thread.is_alive():
+            self.pnl_update_thread.join(timeout=2)
+
+        # 发送关闭指令给所有工作进程
+        for name, queue in self.task_queues.items():
+            if self.worker_processes[name].is_alive():
+                try:
+                    queue.put({'command': 'shutdown'})
+                except Exception as e:
+                    logger.error(f"发送关闭指令到 '{name}' 失败: {e}")
+
+        # 等待所有进程终止
+        for name, process in self.worker_processes.items():
+            try:
+                process.join(timeout=5)
+                if process.is_alive():
+                    logger.warning(f"工作进程 '{name}' 未能在5秒内终止，将强制终止。")
+                    process.terminate()
+            except Exception as e:
+                logger.error(f"等待或终止进程 '{name}' 时出错: {e}")
+        
+        # 等待结果监听线程结束
+        if self.result_listener_thread and self.result_listener_thread.is_alive():
+            self.result_listener_thread.join(timeout=2)
+
+        self.is_running = False
+        
+        # 更新UI状态
+        for name in self.worker_processes.keys():
+            self.connection_signal.update_account_status.emit({
+                'name': name, 'status': 'disconnected', 'balance': 0, 
+                'equity': 0, 'margin': 0, 'path': ''
+            })
+
+        self.worker_processes.clear()
+        self.task_queues.clear()
+        self.result_queue = None
+
+        logger.info("AccountManager 已成功关闭。")
+
+    def _account_info_updater(self):
+        """Periodically request account info from all workers."""
+        while not self.stop_event.wait(self.pnl_update_interval):
+            with self.lock:
+                for name, process in self.worker_processes.items():
+                    if process.is_alive():
+                        try:
+                            self.task_queues[name].put_nowait({'command': 'get_account_info'})
+                        except queue.Full:
+                            logger.warning(f"指令队列 to '{name}' is full. Skipping account info update.")
+                        except Exception as e:
+                            logger.error(f"发送 get_account_info 指令到 '{name}' 失败: {e}")
+
+    def get_account_info(self, account_name: str) -> Optional[Dict]:
+        """获取单个账户的信息。"""
+        response = self._send_request_and_wait(account_name, "get_account_info")
+        if response and response.get("status") == "success":
+            return response.get("payload", {})
         return None
 
-    @staticmethod
-    def _release_connection(mt5_instance: Optional[mt5]):
-        """释放（关闭）一个MT5连接。"""
-        if mt5_instance:
-            mt5_instance.shutdown()
+    def get_symbol_info(self, account_name: str, symbol: str) -> Optional[Dict]:
+        """从指定的工作进程获取品种信息。"""
+        payload = {"symbol": symbol}
+        response = self._send_request_and_wait(account_name, "get_symbol_info", payload)
+        if response and response.get("status") == "success":
+            return response.get("info")
+        return None
 
-    def execute_trade(self, account_name: str, trade_request: Dict[str, Any]) -> Dict[str, Any]:
-        """在单个账户上安全地执行交易请求。"""
-        mt5_conn = self._get_connection(account_name)
-        if not mt5_conn:
-            return {"status": "error", "message": f"无法建立到 {account_name} 的安全连接。"}
+    def get_all_symbols(self, account_name: str) -> Optional[List[str]]:
+        """获取指定账户的所有可用交易品种。"""
+        response = self._send_request_and_wait(account_name, "get_all_symbols")
+        if response and response.get("status") == "success":
+            return response.get("symbols", [])
+        return None
 
-        try:
-            logger.info(f"在账户 {account_name} 上执行交易: {trade_request}")
-            result = mt5_conn.order_send(trade_request)
-            
-            if result is None:
-                error_message = f"订单发送失败，MT5返回None。错误: {mt5_conn.last_error()}"
-                logger.error(error_message)
-                return {"status": "error", "message": error_message}
-
-            if result.retcode != mt5.TRADE_RETCODE_DONE:
-                error_message = f"交易失败: {result.comment} (Retcode: {result.retcode})"
-                logger.warning(error_message)
-                return {"status": "error", "message": error_message, "result": result}
-            
-            success_message = f"交易成功，订单号: {result.order}"
-            logger.info(success_message)
-            return {"status": "success", "message": success_message, "result": result}
-
-        except Exception as e:
-            logger.error(f"在账户 {account_name} 上交易时发生意外: {e}", exc_info=True)
-            return {"status": "error", "message": str(e)}
-        finally:
-            self._release_connection(mt5_conn)
-
-    def execute_trades_parallel(self, trade_requests: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-        """并行执行一批交易请求。"""
-        if not trade_requests:
+    def get_all_follower_info(self) -> Dict[str, Any]:
+        """并行获取所有已启用跟单账户的信息。"""
+        if not self.is_running:
+            logger.error("AccountManager 未运行。")
             return {}
-        
-        # 确保线程池正在运行
-        self._ensure_executor_running()
-        
-        from concurrent.futures import as_completed
-        with self.executor_lock:
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(self.follower_configs)) as executor:
             future_to_account = {
-                self.executor.submit(self.execute_trade, name, req): name
-                for name, req in trade_requests.items()
+                executor.submit(self.get_account_info, name): name
+                for name in self.follower_configs
             }
-
-        results = {}
-        for future in as_completed(future_to_account):
-            account_name = future_to_account[future]
-            try:
-                trade_result = future.result()
-                results[account_name] = trade_result
-                if self._trade_callback:
-                    self._trade_callback(account_name, trade_result)
-            except Exception as exc:
-                logger.error(f"线程池任务 for '{account_name}' 异常: {exc}", exc_info=True)
-                results[account_name] = {"status": "error", "message": str(exc)}
+            results = {}
+            for future in concurrent.futures.as_completed(future_to_account):
+                account_name = future_to_account[future]
+                try:
+                    info = future.result()
+                    if info:
+                        results[account_name] = info
+                except Exception as exc:
+                    logger.error(f"为账户 {account_name} 获取信息时生成了异常: {exc}", exc_info=True)
         return results
-            
-    def get_account_info(self, account_name: str) -> Optional[Any]:
-        """安全地获取指定账户的信息。"""
-        mt5_conn = self._get_connection(account_name)
-        if not mt5_conn:
-            return None
         
-        try:
-            return mt5_conn.account_info()
-        finally:
-            self._release_connection(mt5_conn)
-
-    def shutdown(self):
-        """关闭线程池。"""
-        with self.executor_lock:
-            logger.info("正在关闭 AccountManager 线程池...")
-            self._is_shutdown = True
-            self.executor.shutdown(wait=True)
-            logger.info("AccountManager 已关闭。")
-
-    def restart(self):
-        """重新启动账户管理器"""
-        with self.executor_lock:
-            if self._is_shutdown or self.executor._shutdown:
-                logger.info("正在重新启动 AccountManager...")
-                self.executor = ThreadPoolExecutor(max_workers=10, thread_name_prefix='MT5Executor')
-                self._is_shutdown = False
-                logger.info("AccountManager 已重新启动。")
-
-    def register_trade_callback(self, callback: Callable[[str, Dict], None]):
-        """注册交易执行后的回调。"""
+    def register_trade_callback(self, callback):
         self._trade_callback = callback
 
-    def normalize_volume(self, account_name: str, symbol: str, volume: float) -> float:
-        """Normalize lot size according to symbol settings."""
-        symbol_info = mt5.symbol_info(symbol)
-        if symbol_info is None:
-            return volume
+    def execute_trades_parallel(self, trade_requests: List[Dict]) -> Dict[str, Any]:
+        """并行地在多个账户上执行交易。"""
+        if not self.is_running:
+            logger.error("AccountManager 未运行，无法执行交易。")
+            return {}
+        
+        # 过滤掉没有工作进程的账户请求
+        valid_requests = []
+        for request in trade_requests:
+            account_name = request.get("account_name")
+            if account_name in self.task_queues:
+                valid_requests.append(request)
+            else:
+                logger.warning(f"账户 '{account_name}' 没有工作进程，跳过交易请求")
+            
+        if not valid_requests:
+            logger.warning("没有有效的交易请求，所有账户都没有工作进程")
+            return {}
+            
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(self.follower_configs)) as executor:
+            future_to_account = {
+                executor.submit(self.execute_trade, request): request["account_name"]
+                for request in valid_requests
+            }
 
-        volume = max(symbol_info.volume_min, min(volume, symbol_info.volume_max))
-        step = symbol_info.volume_step
-        if step > 0:
-            volume = round(volume / step) * step
-        return volume
+            results = {}
+            for future in concurrent.futures.as_completed(future_to_account):
+                account_name = future_to_account[future]
+                try:
+                    trade_result = future.result()
+                    if trade_result:
+                        results[account_name] = trade_result
+                except Exception as exc:
+                    logger.error(f"为账户 {account_name} 执行交易时生成了异常: {exc}", exc_info=True)
+            return results
+
+    def execute_trade(self, request: Dict) -> Optional[Dict]:
+        """在单个账户上执行交易。"""
+        account_name = request.pop("account_name")
+        return self._send_request_and_wait(
+            account_name,
+            "execute_trade",
+            payload=request
+        )
+
+    def get_positions(self, account_name: str, ticket: Optional[int] = None) -> Optional[List[Dict]]:
+        """从指定的工作进程同步获取持仓信息。"""
+        payload = {"ticket": ticket}
+        response = self._send_request_and_wait(account_name, "get_positions", payload)
+        if response and response.get("status") == "success":
+            return response.get("payload", {})
+        return None
 
     def execute_single_trade(self, account_name: str, request: Dict[str, Any]) -> Dict[str, Any]:
         """
         执行单笔交易请求
-        
-        Args:
-            account_name: 账户名称
-            request: 交易请求字典
-            
-        Returns:
-            交易结果字典，包含status和其他信息
         """
-        # 直接调用内部方法执行交易，这样可以利用现有的重试机制
-        return self.execute_trade(account_name, request) 
+        # 添加账户名到请求中
+        request_copy = request.copy()
+        request_copy["account_name"] = account_name
+        return self.execute_trade(request_copy)
+
+    def _send_request_async(self, account_name, action, payload=None):
+        """
+        异步发送请求到指定账户的工作进程。
+        """
+        # 生成唯一的相关ID
+        correlation_id = self._generate_correlation_id()
+        
+        # 创建请求
+        request = {
+            "action": action,
+            "correlation_id": correlation_id
+        }
+        
+        if payload is not None:
+            request["payload"] = payload
+        
+        # 创建Future
+        future = concurrent.futures.Future()
+        
+        # 存储等待响应的请求
+        with self.lock:
+            self.pending_requests[correlation_id] = future
+        
+        # 发送请求到工作进程
+        self.task_queues[account_name].put(request)
+        
+        return future
+
+    def _process_results(self):
+        """
+        处理从工作进程返回的结果。
+        
+        此方法在一个单独的线程中运行，不断从结果队列中获取结果，
+        并将其与等待的请求匹配。
+        """
+        while True:
+            try:
+                # 从结果队列中获取结果
+                result = self.result_queue.get()
+                
+                if result is None:
+                    # 结果队列已关闭
+                    break
+                
+                # 提取相关ID
+                correlation_id = result.get("correlation_id")
+                
+                if correlation_id is not None:
+                    # 查找对应的Future
+                    with self.lock:
+                        future = self.pending_requests.pop(correlation_id, None)
+                    
+                    if future is not None:
+                        # 设置Future的结果
+                        future.set_result(result)
+                    else:
+                        self.logger.warning(f"收到未知相关ID的结果: {correlation_id}")
+                else:
+                    # 没有相关ID的结果，可能是错误或状态更新
+                    account_name = result.get("account_name", "未知账户")
+                    status = result.get("status")
+                    message = result.get("message", "无消息")
+                    
+                    if status == "error":
+                        self.logger.error(f"账户 {account_name} 报告错误: {message}")
+                    else:
+                        self.logger.info(f"账户 {account_name} 状态更新: {message}")
+            
+            except Exception as e:
+                self.logger.error(f"处理结果时出错: {e}", exc_info=True)
+                time.sleep(1)  # 防止快速错误循环
+
+    def _generate_correlation_id(self):
+        """
+        生成唯一的相关ID。
+        
+        Returns:
+            str: 唯一的相关ID
+        """
+        with self.lock:
+            correlation_id = f"req-{self.next_correlation_id}"
+            self.next_correlation_id += 1
+            return correlation_id 
+
+    def _test_worker_connection(self, account_name: str, task_queue: multiprocessing.Queue) -> bool:
+        """测试工作进程是否正常响应"""
+        try:
+            # 先检查结果队列中是否有初始化状态消息
+            start_time = time.time()
+            while time.time() - start_time < 2:  # 2秒超时
+                try:
+                    result = self.result_queue.get_nowait()
+                    if (result.get("account_name") == account_name and 
+                        result.get("type") == "init_status"):
+                        return result.get("status") == "success"
+                    # 如果不是我们要的消息，放回队列
+                    self.result_queue.put(result)
+                except queue.Empty:
+                    time.sleep(0.1)
+            return False
+        except Exception as e:
+            logger.error(f"测试工作进程 '{account_name}' 连接时出错: {e}")
+            return False
+
+    def get_worker_status(self) -> Dict[str, str]:
+        """获取所有工作进程的状态"""
+        status = {}
+        for name, worker in self.worker_processes.items():
+            if worker.is_alive():
+                # 发送ping命令测试响应
+                response = self._send_request_and_wait(name, "ping", timeout=2.0)
+                if response and response.get("status") == "success":
+                    status[name] = "运行中"
+                else:
+                    status[name] = "无响应"
+            else:
+                status[name] = "已停止"
+        
+        # 检查配置中但没有工作进程的账户
+        for name in self.follower_configs:
+            if name not in status:
+                if name not in self.task_queues:
+                    status[name] = "未启动"
+                else:
+                    status[name] = "初始化失败"
+        
+        return status 
+
+    def get_all_account_info(self) -> Dict[str, Any]:
+        """
+        获取所有工作进程的最新状态信息。
+        注意: 此方法不会主动请求新信息，而是返回当前已知的状态。
+        """
+        all_info = {}
+        with self.lock:
+            for name, process in self.worker_processes.items():
+                status = "running" if process.is_alive() else "stopped"
+                # TODO: We can store the last known info to provide more details
+                all_info[name] = {
+                    "status": status, 
+                    "pid": process.pid
+                }
+        return all_info 

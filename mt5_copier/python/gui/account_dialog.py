@@ -11,7 +11,6 @@ from PyQt5.QtCore import Qt
 from typing import Dict, Optional, List
 
 class AccountConfigDialog(QDialog):
-    """Account configuration dialog window"""
 
     # 初始化账户配置对话框
     def __init__(self, parent=None, account_config: Optional[Dict] = None):
@@ -55,16 +54,15 @@ class AccountConfigDialog(QDialog):
         self.server_edit.setPlaceholderText("如: MetaQuotes-Demo")
         form.addRow("服务器:", self.server_edit)
         
-        # Terminal path
-        path_layout = QHBoxLayout()
+        # MT5终端路径
+        terminal_layout = QHBoxLayout()
         self.terminal_path_edit = QLineEdit()
-        self.terminal_path_edit.setPlaceholderText("可选，但强烈推荐，用于精确连接")
-        self.browse_path_btn = QPushButton("浏览...")
-        self.browse_path_btn.clicked.connect(self._browse_terminal_path)
-        
-        path_layout.addWidget(self.terminal_path_edit)
-        path_layout.addWidget(self.browse_path_btn)
-        form.addRow("终端路径 (terminal64.exe):", path_layout)
+        self.terminal_path_edit.setPlaceholderText("选择MT5终端路径 (必填)")
+        self.browse_button = QPushButton("浏览...")
+        self.browse_button.clicked.connect(self._browse_terminal_path)
+        terminal_layout.addWidget(self.terminal_path_edit)
+        terminal_layout.addWidget(self.browse_button)
+        form.addRow("MT5终端路径:", terminal_layout)
         
         # Strategy section
         strategy_label = QLabel("<b>跟单策略设置</b>")
@@ -87,7 +85,7 @@ class AccountConfigDialog(QDialog):
         self.lot_value_spin.setDecimals(2)
         self.lot_value_spin.setRange(0.01, 1000.0)
         self.lot_value_spin.setSingleStep(0.01)
-        self.lot_value_label = QLabel("手")
+        self.lot_value_label = QLabel("值")
         
         lot_layout = QHBoxLayout()
         lot_layout.addWidget(self.lot_value_spin)
@@ -195,6 +193,17 @@ class AccountConfigDialog(QDialog):
         for row in sorted(selected_rows, reverse=True):
             self.symbol_mapping_table.removeRow(row)
             
+    def _browse_terminal_path(self):
+        """浏览并选择MT5终端路径"""
+        file_dialog = QFileDialog(self)
+        file_dialog.setFileMode(QFileDialog.ExistingFile)
+        file_dialog.setNameFilter("MT5终端 (terminal.exe);;所有文件 (*.*)")
+        
+        if file_dialog.exec_():
+            selected_files = file_dialog.selectedFiles()
+            if selected_files:
+                self.terminal_path_edit.setText(selected_files[0])
+            
     def _load_config(self):
         """Load configuration into UI"""
         if not self.account_config:
@@ -208,6 +217,7 @@ class AccountConfigDialog(QDialog):
             self.copy_sl_tp_check.setChecked(True)
             self.copy_pending_check.setChecked(True)
             self.copy_reversed_sl_tp_check.setChecked(True)
+            self.terminal_path_edit.setText("")  # 默认为空
             
             # 添加一些常用的默认映射作为示例
             self.symbol_mapping_table.insertRow(0)
@@ -266,42 +276,30 @@ class AccountConfigDialog(QDialog):
     
     def _update_lot_ui(self, index: int):
         """Update UI based on selected lot mode"""
-        if index == 0:  # Fixed
-            self.lot_value_label.setText("手")
+        if index in [0, 1]:  # 固定或倍数
+            self.lot_value_label.setText("值")
+            self.lot_value_spin.setSuffix("")
             self.lot_value_spin.setDecimals(2)
-            self.lot_value_spin.setRange(0.01, 1000.0)
             self.lot_value_spin.setSingleStep(0.01)
-        elif index == 1:  # Multiplier
-            self.lot_value_label.setText("倍")
+        elif index == 2:  # 风险百分比
+            self.lot_value_label.setText("% 的余额")
+            self.lot_value_spin.setSuffix(" %")
             self.lot_value_spin.setDecimals(2)
-            self.lot_value_spin.setRange(0.01, 1000.0)
             self.lot_value_spin.setSingleStep(0.1)
-        else:  # Risk percentage
-            self.lot_value_label.setText("%")
-            self.lot_value_spin.setDecimals(1)
-            self.lot_value_spin.setRange(0.1, 100.0)
-            self.lot_value_spin.setSingleStep(0.1)
-    
-    def _browse_terminal_path(self):
-        """Browse for MT5 terminal executable"""
-        file_path, _ = QFileDialog.getOpenFileName(
-            self,
-            "选择MT5终端",
-            "",
-            "MT5 终端 (terminal64.exe);;所有文件 (*)"
-        )
-        if file_path:
-            self.terminal_path_edit.setText(file_path)
     
     def _show_warning(self, title: str, message: str, widget_to_focus):
-        """Helper to show a warning message box and set focus."""
-        QMessageBox.warning(self, title, message)
+        """显示警告信息并聚焦到指定控件"""
+        msg_box = QMessageBox(self)
+        msg_box.setIcon(QMessageBox.Warning)
+        msg_box.setText(message)
+        msg_box.setWindowTitle(title)
+        msg_box.exec_()
         if widget_to_focus:
             widget_to_focus.setFocus()
             
     def _validate_and_accept(self):
-        """Validate form before accepting"""
-        # Required fields
+        """验证输入并在有效时接受对话框"""
+        # 验证账户名称
         if not self.name_edit.text().strip():
             self._show_warning("验证失败", "请输入账户名称", self.name_edit)
             return
@@ -316,6 +314,10 @@ class AccountConfigDialog(QDialog):
             
         if not self.server_edit.text().strip():
             self._show_warning("验证失败", "请输入服务器", self.server_edit)
+            return
+            
+        if not self.terminal_path_edit.text().strip():
+            self._show_warning("验证失败", "请选择MT5终端路径", self.terminal_path_edit)
             return
             
         # 验证交易品种映射
@@ -340,42 +342,37 @@ class AccountConfigDialog(QDialog):
         self.accept()
         
     def get_config(self) -> Dict:
-        """Get the account configuration from the dialog fields"""
-        # Map lot mode combo box index to config value
-        lot_mode_map = ["fixed", "multiplier", "risk_percentage"]
-        
-        # Get the symbol mappings from the table
+        """从UI控件中获取配置"""
+        # 从表格中读取品种映射
         symbol_mappings = {}
         for row in range(self.symbol_mapping_table.rowCount()):
-            master_symbol = self.symbol_mapping_table.item(row, 0)
-            follower_symbol = self.symbol_mapping_table.item(row, 1)
+            master_item = self.symbol_mapping_table.item(row, 0)
+            follower_item = self.symbol_mapping_table.item(row, 1)
             
-            # Only add mappings where both fields are filled
-            if (master_symbol and follower_symbol and 
-                master_symbol.text().strip() and follower_symbol.text().strip()):
-                symbol_mappings[master_symbol.text().strip()] = follower_symbol.text().strip()
+            if master_item and follower_item:
+                master_symbol = master_item.text().strip()
+                follower_symbol = follower_item.text().strip()
+                if master_symbol and follower_symbol:
+                    symbol_mappings[master_symbol] = follower_symbol
+
+        strategy = "regular" if self.strategy_combo.currentIndex() == 0 else "reverse"
+        lot_mode_map = {0: "fixed", 1: "multiplier", 2: "risk_percentage"}
+        lot_mode = lot_mode_map.get(self.lot_mode_combo.currentIndex(), "fixed")
         
-        # Build the configuration dictionary
-        config = {
+        return {
             "name": self.name_edit.text(),
-            "login": int(self.login_edit.text()) if self.login_edit.text().isdigit() else 0,
+            "login": int(self.login_edit.text()),
             "password": self.password_edit.text(),
             "server": self.server_edit.text(),
             "terminal_path": self.terminal_path_edit.text(),
-            
-            "strategy": "regular" if self.strategy_combo.currentIndex() == 0 else "reverse",
-            "lot_mode": lot_mode_map[self.lot_mode_combo.currentIndex()],
+            "strategy": strategy,
+            "lot_mode": lot_mode,
             "lot_value": self.lot_value_spin.value(),
             "copy_sl_tp": self.copy_sl_tp_check.isChecked(),
             "copy_reversed_sl_tp": self.copy_reversed_sl_tp_check.isChecked(),
             "copy_pending": self.copy_pending_check.isChecked(),
-            
             "max_slippage_pips": self.max_slippage_spin.value(),
             "max_latency_ms": self.max_latency_spin.value(),
             "enabled": self.enabled_check.isChecked(),
-            
-            # Add the symbol mappings to the configuration
-            "symbol_mapping": symbol_mappings
+            "symbol_mapping": symbol_mappings,
         }
-        
-        return config 

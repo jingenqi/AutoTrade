@@ -1,0 +1,170 @@
+{
+    "master_account": {
+        "name": "Master_Account",
+        "enabled": true,
+        "login": 6124886,
+        "password": "LDEpmr8#",
+        "server": "ActivTrades-Server",
+        "terminal_path": "D:/metatrader5/v1-mt5/terminal64.exe"
+    },
+    "follower_accounts": [
+        {
+            "name": "Follower1_Regular",
+            "login": 6126075,
+            "password": "JGRjbr3?",
+            "server": "ActivTrades-Server",
+            "terminal_path": "D:/metatrader5/v2-mt5/terminal64.exe",
+            "strategy": "regular",
+            "lot_mode": "risk_percentage",
+            "lot_value": 2.0,
+            "copy_sl_tp": true,
+            "copy_reversed_sl_tp": true,
+            "copy_pending": true,
+            "max_slippage_pips": 3,
+            "max_latency_ms": 500,
+            "enabled": true,
+            "symbol_mapping": {
+                "GBPUSD": "GBPUSD",
+                "EURUSD": "EURUSD",
+                "XAUUSD": "GOLD"
+            },
+            "risk_profile": {
+                "max_daily_loss": 1000,
+                "max_daily_loss_percent": 5.0,
+                "max_positions": 10,
+                "max_volume_per_trade": 5.0,
+                "max_total_volume": 20.0,
+                "max_drawdown_percent": 15.0,
+                "min_free_margin_percent": 30.0,
+                "max_correlation_positions": 3,
+                "trading_hours": [
+                    ["09:00", "17:00"],
+                    ["20:00", "23:00"]
+                ],
+                "excluded_days": [6, 0],
+                "excluded_dates": ["2024-01-01", "2024-12-25"],
+                "allowed_symbols": [],
+                "excluded_symbols": ["BTCUSD", "ETHUSD"],
+                "symbol_max_volume": {
+                    "XAUUSD": 2.0,
+                    "GOLD": 2.0
+                },
+                "force_sl_tp": true,
+                "max_sl_pips": 50,
+                "min_risk_reward_ratio": 1.5
+            }
+        },
+        {
+            "name": "Follower2_Reverse",
+            "login": 6126076,
+            "password": "KHSjds8#",
+            "server": "ActivTrades-Server",
+            "terminal_path": "D:/metatrader5/v3-mt5/terminal64.exe",
+            "strategy": "reverse",
+            "lot_mode": "fixed",
+            "lot_value": 0.1,
+            "copy_sl_tp": true,
+            "copy_reversed_sl_tp": true,
+            "copy_pending": false,
+            "max_slippage_pips": 5,
+            "max_latency_ms": 1000,
+            "enabled": true,
+            "symbol_mapping": {
+                "GBPUSD": "GBPUSDm",
+                "EURUSD": "EURUSDm"
+            },
+            "risk_profile": {
+                "max_daily_loss_percent": 3.0,
+                "max_positions": 5,
+                "max_volume_per_trade": 1.0,
+                "min_free_margin_percent": 50.0
+            }
+        },
+        {
+            "name": "Follower3_Conservative",
+            "login": 6126077,
+            "password": "PLMnhy7$",
+            "server": "ActivTrades-Server",
+            "terminal_path": "D:/metatrader5/v4-mt5/terminal64.exe",
+            "strategy": "regular",
+            "lot_mode": "multiplier",
+            "lot_value": 0.5,
+            "copy_sl_tp": true,
+            "copy_reversed_sl_tp": false,
+            "copy_pending": true,
+            "max_slippage_pips": 2,
+            "max_latency_ms": 300,
+            "enabled": false,
+            "symbol_mapping": {},
+            "risk_profile": {
+                "max_daily_loss": 500,
+                "max_positions": 3,
+                "max_volume_per_trade": 0.5,
+                "force_sl_tp": true
+            }
+        }
+    ],
+    "zmq_settings": {
+        "transport": "tcp",
+        "tcp_host": "localhost",
+        "req_port": 5555,
+        "sub_port": 5556,
+        "ipc_sync_path": "mt5_sync.ipc",
+        "ipc_bus_path": "mt5_trade.ipc",
+        "heartbeat_interval_seconds": 5,
+        "reconnect_delay_seconds": 3
+    },
+    "engine": {
+        "profit_update_interval_seconds": 3,
+        "max_trade_retries": 3,
+        "retry_delay_seconds": 2,
+        "position_sync_interval_seconds": 30,
+        "state_backup_interval_seconds": 60
+    },
+    "gui": {
+        "status_update_interval_seconds": 5,
+        "dashboard_refresh_interval_seconds": 5,
+        "show_notifications": true,
+        "notification_sound": true,
+        "theme": "light"
+    },
+    "monitoring": {
+        "enable_telegram_alerts": false,
+        "telegram_bot_token": "",
+        "telegram_chat_id": "",
+        "alert_on_errors": true,
+        "alert_on_large_slippage": true,
+        "large_slippage_threshold_pips": 10,
+        "alert_on_connection_loss": true
+    },
+    "logging": {
+        "log_level": "INFO",
+        "max_log_file_size_mb": 100,
+        "max_log_files": 10,
+        "log_to_file": true,
+        "log_to_console": true,
+        "separate_error_log": true
+    },
+    "performance": {
+        "use_connection_pool": true,
+        "max_parallel_trades": 10,
+        "trade_queue_size": 100,
+        "enable_trade_cache": true,
+        "cache_ttl_seconds": 60
+    },
+    "database": {
+        "trade_history_db": "trade_history.db",
+        "enable_trade_history": true,
+        "history_retention_days": 90,
+        "backup_enabled": true,
+        "backup_interval_hours": 24
+    },
+    "security": {
+        "encrypt_passwords": false,
+        "allowed_ips": [],
+        "enable_api_key": false,
+        "api_key": ""
+    },
+    "magic_number": 12345,
+    "state_file": "trade_state.json"
+} 

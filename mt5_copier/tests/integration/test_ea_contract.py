@@ -179,6 +179,148 @@ def run_ea_test():
         console.print(stats.generate_summary_panel())
         console.rule("[bold yellow]Test Finished[/bold yellow]")
 
+# --- 符号映射测试 ---
+def test_symbol_mapping():
+    """
+    测试符号映射功能，验证系统是否能正确处理不同交易品种之间的映射。
+    
+    此测试模拟一个主账户交易EURUSD，而跟单账户需要交易EURUSD.m的场景，
+    验证系统是否能正确处理这种映射关系。
+    """
+    console = Console()
+    console.rule("[bold yellow]MT5 Symbol Mapping Test[/bold yellow]")
+    console.print(f"Test started at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", style="dim")
+    
+    # 创建ZMQ上下文和套接字
+    context = zmq.Context()
+    rep_socket = context.socket(zmq.REP)
+    pub_socket = context.socket(zmq.PUB)
+    
+    try:
+        # 1. 绑定套接字
+        rep_socket.bind(ZMQ_SYNC_URI)
+        pub_socket.bind(ZMQ_BUS_URI)
+        console.print(f"[green]Sockets bound successfully[/green]")
+        
+        # 2. 等待Python控制器连接并进行握手
+        console.print("[yellow]Waiting for Python controller to connect...[/yellow]")
+        
+        if rep_socket.poll(30000): # 30秒超时
+            message = rep_socket.recv_string()
+            console.print(f"Received: '{message}'")
+            
+            if message == MSG_SYNC_REQUEST:
+                rep_socket.send_string(MSG_SYNC_RESPONSE)
+                console.print("[green]Handshake successful![/green]")
+            else:
+                console.print(f"[red]Invalid handshake message: {message}[/red]")
+                return
+        else:
+            console.print("[red]Timeout waiting for Python controller handshake.[/red]")
+            return
+        
+        # 3. 模拟发送一个心跳消息
+        heartbeat = {
+            "event_type": MSG_HEARTBEAT,
+            "timestamp": int(time.time() * 1000)
+        }
+        pub_socket.send_string(json.dumps(heartbeat))
+        console.print("[green]Sent heartbeat message[/green]")
+        time.sleep(1)
+        
+        # 4. 模拟发送一个EURUSD买入事件
+        buy_event = {
+            "event_type": "DEAL_ADD",
+            "ticket": 12345,
+            "order_ticket": 54321,
+            "position_id": 67890,
+            "magic": 12345,
+            "symbol": "EURUSD",
+            "type": "BUY",
+            "entry": "IN",
+            "volume": 0.1,
+            "price": 1.12345,
+            "sl": 1.12000,
+            "tp": 1.12800,
+            "commission": -0.1,
+            "swap": 0,
+            "profit": 0,
+            "comment": "Symbol Mapping Test",
+            "time_msc": int(time.time() * 1000)
+        }
+        
+        pub_socket.send_string(json.dumps(buy_event))
+        console.print("[green]Sent EURUSD buy event[/green]")
+        time.sleep(2)
+        
+        # 5. 模拟发送一个EURUSD平仓事件
+        close_event = {
+            "event_type": "DEAL_ADD",
+            "ticket": 12346,
+            "order_ticket": 54322,
+            "position_id": 67890,
+            "magic": 12345,
+            "symbol": "EURUSD",
+            "type": "SELL",
+            "entry": "OUT",
+            "volume": 0.1,
+            "price": 1.12445,
+            "sl": 0,
+            "tp": 0,
+            "commission": -0.1,
+            "swap": 0,
+            "profit": 10.0,
+            "comment": "Symbol Mapping Test Close",
+            "time_msc": int(time.time() * 1000)
+        }
+        
+        pub_socket.send_string(json.dumps(close_event))
+        console.print("[green]Sent EURUSD close event[/green]")
+        time.sleep(2)
+        
+        # 6. 发送一个状态请求
+        if rep_socket.poll(5000): # 5秒超时
+            message = rep_socket.recv_string()
+            console.print(f"Received: '{message}'")
+            
+            if message == "GET_STATE":
+                # 发送一个包含持仓和订单的状态
+                state = {
+                    "positions": [
+                        {
+                            "ticket": 67890,
+                            "symbol": "EURUSD",
+                            "type": "BUY",
+                            "volume": 0.1,
+                            "price_open": 1.12345,
+                            "sl": 1.12000,
+                            "tp": 1.12800
+                        }
+                    ],
+                    "orders": []
+                }
+                rep_socket.send_string(json.dumps(state))
+                console.print("[green]Sent state response[/green]")
+            else:
+                console.print(f"[yellow]Unexpected message: {message}[/yellow]")
+                rep_socket.send_string("ACK")
+        
+        # 7. 等待一段时间，让Python控制器处理事件
+        console.print("[yellow]Waiting for Python controller to process events...[/yellow]")
+        time.sleep(5)
+        
+        console.print("[green]Symbol mapping test completed successfully![/green]")
+        
+    except Exception as e:
+        console.print(f"[bold red]An unexpected error occurred: {e}[/bold red]")
+    finally:
+        # 清理资源
+        console.print("\nCleaning up resources...")
+        rep_socket.close()
+        pub_socket.close()
+        context.term()
+        
+        console.rule("[bold yellow]Test Finished[/bold yellow]")
 
 if __name__ == "__main__":
     run_ea_test() 

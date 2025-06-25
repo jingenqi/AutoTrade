@@ -1,340 +1,316 @@
-"""
-错误处理模块 - 提供生产级别的错误处理和重试机制
-"""
 import logging
+import traceback
 import time
 import functools
-from typing import Callable, Any, Optional, Tuple, Dict
+import json
+from typing import Callable, Any, Optional, Dict, Type, Tuple
 from enum import Enum
-import MetaTrader5 as mt5
-import traceback
+import threading
 
 logger = logging.getLogger("TradeCopier.ErrorHandler")
 
-
+# 定义通用的错误分类
 class ErrorCategory(Enum):
-    """错误分类"""
-    FATAL = "fatal"          # 致命错误，不应重试
-    RETRYABLE = "retryable"  # 可重试错误
-    LOGICAL = "logical"      # 逻辑错误，需要开发者修复
+    # 可恢复的临时性错误，通常由外部系统不稳定引起
+    TRANSIENT = "transient"
+    # 永久性错误，重试无法解决，需要人工干预或配置修复
+    PERMANENT = "permanent"
+    # 配置错误
+    CONFIG = "config"
+    # 输入数据校验失败
+    VALIDATION = "validation"
+    # 程序内部逻辑错误，表明代码存在bug
+    LOGIC = "logic"
 
+# 用于封装和记录详细错误信息的结构化类
+class StructuredError:
+    def __init__(self, exc: Exception, func: Callable, args: Tuple, kwargs: Dict, category: ErrorCategory, context: Optional[Dict] = None):
+        self.timestamp = time.time()
+        self.exception_type = exc.__class__.__name__
+        self.exception_message = str(exc)
+        self.traceback_str = traceback.format_exc()
+        self.function_name = func.__name__
+        self.function_args = args
+        self.function_kwargs = self._filter_sensitive_data(kwargs.copy())
+        self.category = category
+        self.context = context or {}
 
-# MT5错误码映射
-MT5_ERROR_MAPPING = {
-    # 致命错误 - 不应重试
-    10019: (ErrorCategory.FATAL, "账户资金不足"),
-    64: (ErrorCategory.FATAL, "账户被禁用"),
-    133: (ErrorCategory.FATAL, "交易被禁用"),
-    148: (ErrorCategory.FATAL, "订单数量超过限制"),
-    149: (ErrorCategory.FATAL, "对冲被禁止"),
+    # 过滤掉日志中的敏感数据，如密码
+    def _filter_sensitive_data(self, data: Dict) -> Dict:
+        sensitive_keys = ['password', 'secret', 'token', 'key']
+        for key, value in data.items():
+            if any(s_key in key.lower() for s_key in sensitive_keys):
+                data[key] = '********'
+        return data
+
+    # 将错误信息转换为字典格式，便于日志记录或传输
+    def to_dict(self) -> Dict:
+        return {
+            "timestamp": self.timestamp,
+            "category": self.category.value,
+            "error": {
+                "type": self.exception_type,
+                "message": self.exception_message,
+            },
+            "origin": {
+                "function": self.function_name,
+                "args": self.function_args,
+                "kwargs": self.function_kwargs,
+            },
+            "context": self.context,
+            "traceback": self.traceback_str,
+        }
     
-    # 可重试错误
-    146: (ErrorCategory.RETRYABLE, "交易上下文繁忙"),
-    4: (ErrorCategory.RETRYABLE, "交易服务器繁忙"),
-    6: (ErrorCategory.RETRYABLE, "没有连接"),
-    8: (ErrorCategory.RETRYABLE, "请求过于频繁"),
-    128: (ErrorCategory.RETRYABLE, "交易超时"),
-    129: (ErrorCategory.RETRYABLE, "价格已更改"),
-    136: (ErrorCategory.RETRYABLE, "价格已过期"),
-    
-    # 逻辑错误
-    130: (ErrorCategory.LOGICAL, "无效的止损/止盈"),
-    131: (ErrorCategory.LOGICAL, "无效的交易量"),
-    134: (ErrorCategory.LOGICAL, "资金不足"),
-    4753: (ErrorCategory.LOGICAL, "持仓未找到"),
-    4756: (ErrorCategory.LOGICAL, "交易请求发送失败"),
-}
+    # 记录结构化的错误日志
+    def log(self, level: int = logging.ERROR):
+        summary = (
+            f"在 {self.function_name} 中发生错误 ({self.category.value}): "
+            f"{self.exception_type} - {self.exception_message}"
+        )
+        logger.log(level, summary)
+        # 以 DEBUG 级别记录完整的JSON格式错误细节，供深入调试
+        logger.debug(f"错误详情: {json.dumps(self.to_dict(), indent=2, default=str)}")
 
+# 自定义异常，用于表示一个错误已经被处理和记录过
+class HandledException(Exception):
+    def __init__(self, message: str, error_info: StructuredError):
+        super().__init__(message)
+        self.error_info = error_info
 
-class RetryConfig:
-    """重试配置"""
-    def __init__(self, max_attempts: int = 3, initial_delay: float = 0.1,
-                 max_delay: float = 2.0, exponential_base: float = 2.0):
-        self.max_attempts = max_attempts
-        self.initial_delay = initial_delay
-        self.max_delay = max_delay
-        self.exponential_base = exponential_base
-
-
-def classify_mt5_error(retcode: int) -> Tuple[ErrorCategory, str]:
-    """
-    分类MT5错误码
-    
-    Args:
-        retcode: MT5返回码
-        
-    Returns:
-        (错误类别, 错误描述)
-    """
-    if retcode == mt5.TRADE_RETCODE_DONE:
-        return None, "成功"
-        
-    error_info = MT5_ERROR_MAPPING.get(retcode)
-    if error_info:
-        return error_info
-    
-    # 未知错误默认为逻辑错误
-    return ErrorCategory.LOGICAL, f"未知错误码: {retcode}"
-
-
-def with_retry(retry_config: Optional[RetryConfig] = None,
-               error_handler: Optional[Callable[[Exception], bool]] = None):
-    """
-    装饰器：为函数添加重试逻辑
-    
-    Args:
-        retry_config: 重试配置
-        error_handler: 自定义错误处理函数，返回True表示应该重试
-    """
-    if retry_config is None:
-        retry_config = RetryConfig()
-        
+# 装饰器：为函数添加强大的异常捕获、记录和处理能力
+def handle_exceptions(
+    category: ErrorCategory = ErrorCategory.LOGIC,
+    on_error_return: Any = None,
+    re_raise: bool = False,
+    context: Optional[Dict] = None
+):
     def decorator(func: Callable) -> Callable:
         @functools.wraps(func)
-        def wrapper(*args, **kwargs) -> Any:
-            last_exception = None
-            
-            for attempt in range(retry_config.max_attempts):
-                try:
-                    return func(*args, **kwargs)
-                except Exception as e:
-                    last_exception = e
-                    
-                    # 如果有自定义错误处理器，使用它来判断是否重试
-                    if error_handler and not error_handler(e):
-                        raise
-                    
-                    # 如果是最后一次尝试，直接抛出异常
-                    if attempt == retry_config.max_attempts - 1:
-                        logger.error(f"{func.__name__} 在 {retry_config.max_attempts} 次尝试后失败: {e}")
-                        raise
-                    
-                    # 计算延迟时间（指数退避）
-                    delay = min(
-                        retry_config.initial_delay * (retry_config.exponential_base ** attempt),
-                        retry_config.max_delay
-                    )
-                    
-                    logger.warning(f"{func.__name__} 第 {attempt + 1} 次尝试失败: {e}. "
-                                 f"将在 {delay:.2f} 秒后重试...")
-                    time.sleep(delay)
-                    
-            # 这行代码理论上不应该被执行到
-            if last_exception:
-                raise last_exception
+        def wrapper(*args, **kwargs):
+            try:
+                return func(*args, **kwargs)
+            except Exception as e:
+                # 创建结构化错误并记录
+                error_info = StructuredError(e, func, args, kwargs, category, context)
+                error_info.log()
                 
+                if re_raise:
+                    # 重新抛出一个已处理的异常，以便上层调用者知道它已被记录
+                    raise HandledException(f"在 {func.__name__} 中发生错误", error_info) from e
+                
+                # 返回一个预设的默认值
+                return on_error_return
         return wrapper
     return decorator
 
+# 装饰器：为函数添加带有指数退避策略的重试逻辑
+def with_retry(
+    max_attempts: int = 3,
+    initial_delay: float = 0.5,
+    backoff_factor: float = 2.0,
+    retry_on_exceptions: Tuple[Type[Exception], ...] = (Exception,)
+):
+    def decorator(func: Callable) -> Callable:
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            last_exception = None
+            delay = initial_delay
+            for attempt in range(max_attempts):
+                try:
+                    return func(*args, **kwargs)
+                except retry_on_exceptions as e:
+                    last_exception = e
+                    if attempt == max_attempts - 1:
+                        logger.error(
+                            f"函数 '{func.__name__}' 在 {max_attempts} 次尝试后彻底失败。最终错误: {e}"
+                        )
+                        break
+                    
+                    logger.warning(
+                        f"'{func.__name__}' 的第 {attempt + 1}/{max_attempts} 次尝试因 {e.__class__.__name__} 失败。 "
+                        f"将在 {delay:.2f} 秒后重试。"
+                    )
+                    time.sleep(delay)
+                    delay *= backoff_factor
+            
+            if last_exception:
+                raise last_exception
+        return wrapper
+    return decorator
+
+# MT5错误码分类
+def classify_mt5_error(retcode: int) -> Tuple[Optional[ErrorCategory], str]:
+    """
+    根据MQL5文档对MT5返回码进行分类
+    https://www.mql5.com/en/docs/constants/errorswarnings/enum_trade_return_codes
+    """
+    # 成功
+    if retcode == 10009:  # TRADE_RETCODE_DONE
+        return None, "Request completed"
+
+    # 可重试的临时性错误
+    retryable_codes = {
+        10013: "Requote",
+        10018: "Server is busy",
+        10019: "Server is busy",
+        10021: "Connection to trade server is lost",
+        10024: "Not enough money to perform the operation",
+        10027: "There are no prices",
+        10028: "New prices came",
+    }
+    if retcode in retryable_codes:
+        return ErrorCategory.TRANSIENT, retryable_codes[retcode]
+
+    # 永久性或致命错误
+    fatal_codes = {
+        10012: "Invalid request",
+        10014: "Invalid prices for the operation",
+        10015: "Invalid stops for the operation",
+        10016: "Invalid trade volume",
+        10017: "Closing of the order or position is disabled",
+        10020: "New request was sent",
+        10022: "Operation is prohibited for the client",
+        10023: "The order or position is frozen",
+        10025: "Trade is disabled",
+        10026: "The market is closed",
+    }
+    if retcode in fatal_codes:
+        return ErrorCategory.PERMANENT, fatal_codes[retcode]
+
+    # 逻辑错误（通常是客户端代码问题）
+    logic_codes = {
+        10030: "Unsupported filling type",
+        10031: "No connection to the trade server",
+        10033: "The operation is allowed for live accounts only",
+        10034: "The limit of pending orders has been reached",
+        10035: "The limit of orders and positions for the symbol has been reached",
+    }
+    if retcode in logic_codes:
+        return ErrorCategory.LOGIC, logic_codes[retcode]
+    
+    return ErrorCategory.LOGIC, f"Unknown error code: {retcode}"
+
 
 class TradingErrorHandler:
-    """交易错误处理器"""
-    
-    def __init__(self, config_manager):
+    def __init__(self, config_manager, status_callback: Optional[Callable[[str, str], None]] = None):
         self.config_manager = config_manager
-        self.error_counts: Dict[str, int] = {}  # 跟踪每个账户的错误次数
-        self.disabled_accounts: set = set()     # 被禁用的账户集合
-        
-    def handle_trade_error(self, account_name: str, retcode: int, 
-                          comment: str = "") -> bool:
-        """
-        处理交易错误
-        
-        Args:
-            account_name: 账户名称
-            retcode: MT5返回码
-            comment: 错误注释
-            
-        Returns:
-            是否应该重试
-        """
+        self.status_callback = status_callback
+        self.error_counts: Dict[str, int] = {}
+        self.disabled_accounts: set = set()
+
+    def handle_trade_error(self, account_name: str, retcode: int, comment: str = "") -> bool:
         category, description = classify_mt5_error(retcode)
         
-        if category is None:  # 成功
-            # 重置错误计数
-            self.error_counts[account_name] = 0
+        if category is None:
+            if self.error_counts.get(account_name, 0) > 0:
+                logger.info(f"账户 {account_name} 的交易恢复正常。")
+                self.error_counts[account_name] = 0
             return False
-            
-        # 记录错误
-        logger.error(f"账户 {account_name} 交易错误: {description} (代码: {retcode}). "
-                    f"MT5注释: {comment}")
-        
-        # 增加错误计数
+
+        full_error_msg = f"交易错误: {description} (代码: {retcode}, 注释: {comment})"
+        logger.error(f"账户 {account_name} {full_error_msg}")
+        if self.status_callback:
+            self.status_callback(account_name, full_error_msg)
+
         self.error_counts[account_name] = self.error_counts.get(account_name, 0) + 1
         
-        if category == ErrorCategory.FATAL:
-            # 致命错误：禁用账户
-            self._disable_account(account_name, f"{description} - {comment}")
+        if category == ErrorCategory.PERMANENT:
+            self._disable_account(account_name, f"致命错误: {description}")
             return False
             
-        elif category == ErrorCategory.RETRYABLE:
-            # 可重试错误
-            max_retries = self.config_manager.get_setting("max_trade_retries", 3)
-            if self.error_counts[account_name] <= max_retries:
+        elif category == ErrorCategory.TRANSIENT:
+            max_retries = self.config_manager.get_setting("engine.max_trade_retries", 3)
+            if self.error_counts[account_name] < max_retries:
+                logger.warning(f"账户 {account_name} 将重试交易 ({self.error_counts[account_name]}/{max_retries})")
                 return True
             else:
-                # 重试次数过多，暂时禁用
-                self._disable_account(account_name, 
-                                    f"重试次数过多 ({self.error_counts[account_name]} 次)")
+                self._disable_account(account_name, f"重试次数过多 ({self.error_counts[account_name]} 次)")
                 return False
                 
-        else:  # LOGICAL
-            # 逻辑错误：记录详细信息供开发者调试
-            logger.critical(f"逻辑错误需要修复 - 账户: {account_name}, "
-                           f"错误: {description}, 代码: {retcode}")
+        else: # LOGIC
+            logger.critical(f"账户 {account_name} 出现逻辑错误，需要开发者干预: {description}")
             return False
             
     def _disable_account(self, account_name: str, reason: str):
-        """禁用账户"""
         if account_name not in self.disabled_accounts:
             self.disabled_accounts.add(account_name)
-            logger.critical(f"禁用账户 {account_name}: {reason}")
+            msg = f"已自动禁用账户 {account_name}，原因: {reason}"
+            logger.critical(msg)
+            if self.status_callback:
+                self.status_callback(account_name, msg)
             
-            # 更新配置
-            follower_config = self.config_manager.get_follower_config(account_name)
-            if follower_config:
-                follower_config["enabled"] = False
-                self.config_manager.save_config()
-                
+            # This logic should be carefully considered. Modifying config might not be ideal.
+            # For now, it just disables it in memory.
+            # A more robust solution might emit a signal to the GUI/main process to handle config changes.
+
     def is_account_disabled(self, account_name: str) -> bool:
-        """检查账户是否被禁用"""
         return account_name in self.disabled_accounts
         
     def reset_account_errors(self, account_name: str):
-        """重置账户错误状态"""
         self.error_counts[account_name] = 0
-        self.disabled_accounts.discard(account_name)
-        
-
-def safe_mt5_call(func: Callable, *args, **kwargs) -> Tuple[bool, Any, Optional[str]]:
-    """
-    安全地调用MT5函数
-    
-    Returns:
-        (成功标志, 结果, 错误信息)
-    """
-    try:
-        result = func(*args, **kwargs)
-        
-        # 检查是否有last_error
-        error = mt5.last_error()
-        if error and error[0] != 1:  # 1 表示成功
-            return False, result, f"MT5错误: {error}"
-            
-        return True, result, None
-        
-    except Exception as e:
-        logger.error(f"调用 {func.__name__} 时发生异常: {e}", exc_info=True)
-        return False, None, str(e)
+        if account_name in self.disabled_accounts:
+            self.disabled_accounts.discard(account_name)
+            logger.info(f"已重置账户 {account_name} 的错误状态。")
 
 
 class CircuitBreaker:
-    """
-    断路器模式 - 防止故障扩散
-    """
-    def __init__(self, failure_threshold: int = 5, 
-                 recovery_timeout: float = 60.0):
+    def __init__(self, failure_threshold: int = 5, recovery_timeout: float = 60.0):
         self.failure_threshold = failure_threshold
         self.recovery_timeout = recovery_timeout
         self.failure_count = 0
-        self.last_failure_time = 0
-        self.is_open = False
-        
+        self.last_failure_time = 0.0
+        self._state = "CLOSED"  # Can be CLOSED, OPEN, HALF_OPEN
+        self._lock: Optional[threading.RLock] = None
+
+    def __getstate__(self):
+        """Custom pickling to handle the lock."""
+        state = self.__dict__.copy()
+        state['_lock'] = None
+        return state
+
+    def __setstate__(self, state):
+        """Custom unpickling to recreate the lock."""
+        self.__dict__.update(state)
+        self._lock = None
+
+    @property
+    def lock(self) -> threading.RLock:
+        """Lazy initializer for the lock to make it pickle-safe."""
+        if self._lock is None:
+            self._lock = threading.RLock()
+        return self._lock
+
+    @property
+    def state(self):
+        with self.lock:
+            if self._state == "OPEN":
+                if time.time() - self.last_failure_time > self.recovery_timeout:
+                    self._state = "HALF_OPEN"
+            return self._state
+
+    def record_failure(self):
+        with self.lock:
+            self.failure_count += 1
+            if self.failure_count >= self.failure_threshold:
+                self._state = "OPEN"
+                self.last_failure_time = time.time()
+                logger.warning(f"断路器开启: 连续失败 {self.failure_count} 次。将在 {self.recovery_timeout} 秒后尝试恢复。")
+
+    def record_success(self):
+        with self.lock:
+            self.failure_count = 0
+            if self._state == "HALF_OPEN":
+                self._state = "CLOSED"
+                logger.info("断路器已关闭，服务已恢复。")
+
     def call(self, func: Callable, *args, **kwargs) -> Any:
-        """通过断路器调用函数"""
-        if self.is_open:
-            # 检查是否应该尝试恢复
-            if time.time() - self.last_failure_time > self.recovery_timeout:
-                self.is_open = False
-                self.failure_count = 0
-                logger.info("断路器已关闭，尝试恢复服务")
-            else:
-                raise Exception("断路器开启，服务暂时不可用")
-                
+        if self.state == "OPEN":
+            raise ConnectionAbortedError("断路器开启，服务暂时不可用")
+        
         try:
             result = func(*args, **kwargs)
-            # 成功调用，重置失败计数
-            self.failure_count = 0
+            self.record_success()
             return result
-            
         except Exception as e:
-            self.failure_count += 1
-            self.last_failure_time = time.time()
-            
-            if self.failure_count >= self.failure_threshold:
-                self.is_open = True
-                logger.error(f"断路器开启: 连续失败 {self.failure_count} 次")
-                
-            raise
-
-class ErrorHandler:
-    """错误处理类，提供统一的异常处理机制"""
-    
-    @staticmethod
-    def safe_execute(func: Callable, *args, **kwargs) -> Optional[Any]:
-        """安全执行函数，捕获并记录异常
-        
-        Args:
-            func: 要执行的函数
-            *args: 传递给函数的位置参数
-            **kwargs: 传递给函数的关键字参数
-            
-        Returns:
-            函数的返回值，如果发生异常则返回None
-        """
-        try:
-            return func(*args, **kwargs)
-        except Exception as e:
-            logger.error(f"执行 {func.__name__} 时出错: {str(e)}")
-            logger.debug(traceback.format_exc())
-            return None
-            
-    @classmethod
-    def with_safe_callback(cls, callback_func: Callable, *args, **kwargs) -> Callable:
-        """创建一个安全的回调函数
-        
-        Args:
-            callback_func: 原始回调函数
-            *args: 传递给回调的额外位置参数
-            **kwargs: 传递给回调的额外关键字参数
-            
-        Returns:
-            包装后的安全回调函数
-        """
-        def safe_callback(*cb_args, **cb_kwargs):
-            try:
-                merged_kwargs = {**kwargs, **cb_kwargs}
-                return callback_func(*args, *cb_args, **merged_kwargs)
-            except Exception as e:
-                logger.error(f"回调 {callback_func.__name__} 执行错误: {str(e)}")
-                logger.debug(traceback.format_exc())
-                return None
-        return safe_callback
-        
-    @staticmethod
-    def get_error_info(e: Exception) -> Dict[str, str]:
-        """获取异常的详细信息
-        
-        Args:
-            e: 异常对象
-            
-        Returns:
-            包含异常信息的字典
-        """
-        return {
-            "type": e.__class__.__name__,
-            "message": str(e),
-            "traceback": traceback.format_exc()
-        }
-        
-    @staticmethod
-    def format_exception(e: Exception) -> str:
-        """格式化异常信息为可读字符串
-        
-        Args:
-            e: 异常对象
-            
-        Returns:
-            格式化后的异常信息字符串
-        """
-        return f"{e.__class__.__name__}: {str(e)}"
+            self.record_failure()
+            raise e

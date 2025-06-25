@@ -4,15 +4,16 @@
         "enabled": true,
         "login": 6124886,
         "password": "LDEpmr8#",
-        "server": "ActivTrades-Server"
+        "server": "ActivTrades-Server",
+        "terminal_path": "D:/metatrader5/v1-mt5/terminal64.exe"
     },
     "follower_accounts": [
         {
             "name": "Follower1_Regular",
-            "login": 6115797,
-            "password": "QQXozd5&",
+            "login": 6126075,
+            "password": "JGRjbr3?",
             "server": "ActivTrades-Server",
-            "mt5_path": "D:/metatrader5/v2-mt5/terminal64.exe",
+            "terminal_path": "D:/metatrader5/v2-mt5/terminal64.exe",
             "strategy": "regular",
             "lot_mode": "multiplier",
             "lot_value": 1.0,
@@ -23,8 +24,26 @@
             "max_latency_ms": 500,
             "enabled": true,
             "symbol_mapping": {
-                "GBPUSD": "GBPUSD-sb"
+                "GBPUSD": "GBPUSD"
             }
         }
-    ]
+    ],
+    "zmq_settings": {
+        "transport": "tcp",
+        "tcp_host": "localhost",
+        "req_port": 5555,
+        "sub_port": 5556,
+        "ipc_sync_path": "mt5_sync.ipc",
+        "ipc_bus_path": "mt5_trade.ipc"
+    },
+    "engine": {
+        "profit_update_interval_seconds": 3,
+        "max_trade_retries": 3,
+        "retry_delay_seconds": 2
+    },
+    "gui": {
+        "status_update_interval_seconds": 10
+    },
+    "magic_number": 12345,
+    "state_file": "trade_state.json"
 }

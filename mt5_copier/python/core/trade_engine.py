@@ -1,1243 +1,883 @@
 import json
 import threading
-# from pydantic import ValidationError
-import MetaTrader5 as mt5
+from types import SimpleNamespace
 import logging
 import os
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List, Callable
+import concurrent.futures
+from dataclasses import dataclass, field
 import time
+from datetime import datetime
 
-# 直接从python目录开始导入
-from core.events import DealAddEvent, OrderEvent, PositionModifyEvent
-from core.config_manager import ConfigManager
-from core.account_manager import AccountManager
+from .events import DealAddEvent, OrderEvent, PositionModifyEvent, BaseEvent
+from .config_manager import ConfigManager
+from .account_manager import AccountManager
+from .constants import OrderType, TradeAction, OrderFillingType, OrderTimeType
+from .error_handler import handle_exceptions, ErrorCategory, TradingErrorHandler
+from .trade_history import TradeHistoryManager, TradeRecord
+from .risk_manager import RiskManager
 
-# 设置日志
-logger = logging.getLogger("TradeCopier.TradeEngine")
+logger = logging.getLogger(f"TradeCopier.{__name__}")
 
-# 添加MT5 API兼容性处理
-def get_order_filling_type():
-    """
-    获取MT5 API中支持的订单填充类型常量
-    不同版本的MT5 API可能使用不同的常量名称(ORDER_FILL_* vs ORDER_FILLING_*)
-    """
-    # 首先尝试新版API的常量名称
-    if hasattr(mt5, 'ORDER_FILLING_FOK'):
-        logger.debug("使用ORDER_FILLING_FOK常量")
-        return mt5.ORDER_FILLING_FOK
-    elif hasattr(mt5, 'ORDER_FILLING_IOC'):
-        logger.debug("使用ORDER_FILLING_IOC常量")
-        return mt5.ORDER_FILLING_IOC
-    # 再尝试旧版API的常量名称
-    elif hasattr(mt5, 'ORDER_FILL_FOK'):
-        logger.debug("使用ORDER_FILL_FOK常量")
-        return mt5.ORDER_FILL_FOK
-    elif hasattr(mt5, 'ORDER_FILL_IOC'):
-        logger.debug("使用ORDER_FILL_IOC常量")
-        return mt5.ORDER_FILL_IOC
-    # 如果都不存在，使用数字常量(1通常代表IOC, 2通常代表FOK)
-    else:
-        logger.warning("MT5 API没有提供订单填充类型常量，使用默认值1(IOC)")
-        return 1  # 默认使用IOC(IMMEDIATE_OR_CANCEL)方式
+@dataclass
+class FollowerPosition:
+    ticket: int
+    symbol: str
+    volume: float
+    type: str
+    profit: float = 0.0
+    open_price: float = 0.0
 
-# 定义订单填充类型常量
-ORDER_FILLING_TYPE = get_order_filling_type()
+@dataclass
+class MasterPosition:
+    ticket: int
+    symbol: str
+    volume: float
+    type: str
+    profit: float = 0.0
+    open_price: float = 0.0
+    followers: Dict[str, FollowerPosition] = field(default_factory=dict)
 
 class TradeEngine:
-    # 交易应用程序的核心逻辑单元。它处理接收到的交易事件，应用交易策略逻辑，并与 AccountManager 协调执行交易。
-
-    STATE_FILE = "logs/trade_state.json"
-
-    def __init__(self, config_manager: ConfigManager, account_manager: AccountManager):
-        # 初始化 TradeEngine。
-        # Args:
-        #     config_manager: ConfigManager 的实例。
-        #     account_manager: AccountManager 的实例。
+    # 初始化交易引擎
+    def __init__(self, config_manager: ConfigManager, account_manager: AccountManager, error_handler: "TradingErrorHandler"):
         self.config_manager = config_manager
         self.account_manager = account_manager
-        # 用于跟踪主账户和跟单账户之间关系的映射
-        self.position_map: dict = {}  # {master_position_id: {follower_name: follower_position_id}}
-        self.pending_order_map: dict = {}  # {master_order_id: {follower_name: follower_order_id}}
+        self.error_handler = error_handler
         self.lock = threading.RLock()
         
-        # 用于通知GUI持仓更新的回调
-        self.position_update_callback = None
-
-        # 反向策略的订单类型映射
-        self.reverse_order_type_map = {
-            "BUY": "SELL",
-            "SELL": "BUY",
-            "BUY_LIMIT": "SELL_STOP",
-            "SELL_LIMIT": "BUY_STOP",
-            "BUY_STOP": "SELL_LIMIT",
-            "SELL_STOP": "BUY_LIMIT",
-            "BUY_STOP_LIMIT": "SELL_STOP_LIMIT",
-            "SELL_STOP_LIMIT": "BUY_STOP_LIMIT"
-        }
-
-        # MT5 订单类型字符串到常量映射
-        self.order_type_to_mt5 = {
-            "BUY": mt5.ORDER_TYPE_BUY,
-            "SELL": mt5.ORDER_TYPE_SELL,
-            "BUY_LIMIT": mt5.ORDER_TYPE_BUY_LIMIT,
-            "SELL_LIMIT": mt5.ORDER_TYPE_SELL_LIMIT,
-            "BUY_STOP": mt5.ORDER_TYPE_BUY_STOP,
-            "SELL_STOP": mt5.ORDER_TYPE_SELL_STOP,
-            "BUY_STOP_LIMIT": mt5.ORDER_TYPE_BUY_STOP_LIMIT,
-            "SELL_STOP_LIMIT": mt5.ORDER_TYPE_SELL_STOP_LIMIT
-        }
-
-        self.event_handlers = {
-            "DEAL_ADD": self._handle_deal_add,
-            "ORDER_ADD": self._handle_order_add,
-            "ORDER_UPDATE": self._handle_order_update,
-            "ORDER_DELETE": self._handle_order_delete,
-            "POSITION_MODIFY": self._handle_position_modify,
-        }
-
+        self.position_map: Dict[int, MasterPosition] = {}
+        self.pending_order_map: Dict[str, Dict[str, int]] = {}
+        
+        self.position_update_callback: Optional[Callable[[List[Dict]], None]] = None
         self._load_state_from_disk()
+
+        self._running_update_thread = False
+        self._update_thread = None
+
+        self.reverse_order_type_map = {
+            "BUY": "SELL", "SELL": "BUY",
+            "BUY_LIMIT": "SELL_LIMIT", "SELL_LIMIT": "BUY_LIMIT",
+            "BUY_STOP": "SELL_STOP", "SELL_STOP": "BUY_STOP",
+            "BUY_STOP_LIMIT": "SELL_STOP_LIMIT", "SELL_STOP_LIMIT": "BUY_STOP_LIMIT"
+        }
+        self.order_type_to_mt5 = {
+            "BUY": OrderType.BUY, "SELL": OrderType.SELL,
+            "BUY_LIMIT": OrderType.BUY_LIMIT, "SELL_LIMIT": OrderType.SELL_LIMIT,
+            "BUY_STOP": OrderType.BUY_STOP, "SELL_STOP": OrderType.SELL_STOP,
+            "BUY_STOP_LIMIT": OrderType.BUY_STOP_LIMIT, "SELL_STOP_LIMIT": OrderType.SELL_STOP_LIMIT
+        }
+        self.event_handlers = {
+            "DEAL_ADD": self._handle_new_deal,
+            "ORDER_ADD": self._handle_new_pending_order,
+            "ORDER_UPDATE": self._handle_modify_pending_order,
+            "ORDER_DELETE": self._handle_remove_pending_order,
+            "POSITION_MODIFY": self._handle_position_modify
+        }
         logger.info(f"TradeEngine 已初始化。当前状态包含 {len(self.position_map)} 个主仓位。")
 
-    def _save_state_to_disk(self):
-        # 将当前的持仓和订单映射保存到文件以实现持久化。
-        with self.lock:
-            try:
-                state_data = {
-                    "position_map": self.position_map,
-                    "pending_order_map": self.pending_order_map,
-                }
-                # 确保日志目录存在
-                os.makedirs(os.path.dirname(self.STATE_FILE), exist_ok=True)
-                with open(self.STATE_FILE, "w", encoding='utf-8') as f:
-                    json.dump(state_data, f, indent=2, ensure_ascii=False)
-                logger.debug("已成功将交易状态保存到磁盘。")
-            except Exception as e:
-                logger.error(f"保存状态到磁盘失败: {e}", exc_info=True)
+        # 初始化交易历史和风险管理
+        self.trade_history = TradeHistoryManager()
+        self.risk_manager = RiskManager(config_manager)
 
-    def _load_state_from_disk(self):
-        # 在初始化时从文件加载交易状态。
-        with self.lock:
-            if not os.path.exists(self.STATE_FILE):
-                logger.info("未找到状态文件。将以干净状态启动。")
-                return
+    def start(self):
+        """Starts the background threads for the trade engine."""
+        self.start_profit_updater()
 
-            try:
-                with open(self.STATE_FILE, "r", encoding='utf-8') as f:
-                    state_data = json.load(f)
-                    self.position_map = state_data.get("position_map", {})
-                    self.pending_order_map = state_data.get("pending_order_map", {})
-                    logger.info(f"已成功从磁盘加载交易状态。找到 {len(self.position_map)} 个映射仓位。")
-            except Exception as e:
-                logger.error(f"从磁盘加载状态失败，将重新开始: {e}", exc_info=True)
-                self.position_map = {}
-                self.pending_order_map = {}
+    def stop(self):
+        """Gracefully stops the trade engine and its background threads."""
+        self.stop_profit_updater()
+        logger.info("TradeEngine has been stopped.")
 
-    def sync_state(self, state: dict):
-        # 将引擎的状态与主账户的当前状态同步。在成功（重新）连接到 EA 后调用此方法。
-        # 它会清除现有映射并根据 EA 的实时数据重建它们。
-        # Args:
-        #     state (dict): 包含来自 EA 的 'positions' 和 'orders' 的字典。
-        with self.lock:
-            logger.info("正在与主账户同步状态...")
-            
-            # --- 1. 保存现有映射的备份，以便在需要时恢复 ---
-            old_position_map = self.position_map.copy()
-            old_pending_order_map = self.pending_order_map.copy()
-            
-            # --- 2. 清除现有跟踪映射 ---
-            self.position_map.clear()
-            self.pending_order_map.clear()
-            logger.debug("已清除现有持仓和订单映射。")
+    def start_profit_updater(self):
+        if not self._running_update_thread:
+            self._running_update_thread = True
+            self._update_thread = threading.Thread(target=self._profit_update_loop, daemon=True)
+            self._update_thread.start()
+            logger.info("持仓盈亏更新线程已启动。")
 
-            # --- 3. 从主账户获取当前持仓和订单 ---
-            master_positions = state.get('positions', [])
-            master_orders = state.get('orders', [])
-
-            logger.info(f"主账户状态: {len(master_positions)} 个未平仓头寸, {len(master_orders)} 个挂单。")
-            
-            # --- 4. 尝试恢复现有持仓的映射 ---
-            if master_positions and old_position_map:
-                logger.info("尝试恢复持仓映射关系...")
-                # 将主账户持仓转换为字典，方便查找
-                master_pos_dict = {str(pos.get('ticket', 0)): pos for pos in master_positions}
-                
-                # 检查旧映射中的每个主仓位是否仍然存在
-                for master_pos_id, follower_positions in old_position_map.items():
-                    if master_pos_id in master_pos_dict:
-                        # 主仓位仍然存在，保留映射
-                        self.position_map[master_pos_id] = follower_positions
-                        logger.info(f"恢复了主仓位 {master_pos_id} 的映射: {follower_positions}")
-                
-                logger.info(f"持仓映射恢复完成。恢复了 {len(self.position_map)}/{len(old_position_map)} 个映射。")
-            
-            # --- 5. 尝试恢复挂单的映射 ---
-            if master_orders and old_pending_order_map:
-                logger.info("尝试恢复挂单映射关系...")
-                # 将主账户挂单转换为字典，方便查找
-                master_order_dict = {str(order.get('ticket', 0)): order for order in master_orders}
-                
-                # 检查旧映射中的每个主挂单是否仍然存在
-                for master_order_id, follower_orders in old_pending_order_map.items():
-                    if master_order_id in master_order_dict:
-                        # 主挂单仍然存在，保留映射
-                        self.pending_order_map[master_order_id] = follower_orders
-                        logger.info(f"恢复了主挂单 {master_order_id} 的映射: {follower_orders}")
-                
-                logger.info(f"挂单映射恢复完成。恢复了 {len(self.pending_order_map)}/{len(old_pending_order_map)} 个映射。")
-            
-            # 保存恢复后的状态
-            self._save_state_to_disk()
-            
-            logger.info("状态同步完成。引擎已准备好处理新事件。")
+    def stop_profit_updater(self):
+        self._running_update_thread = False
+        if self._update_thread and self._update_thread.is_alive():
+            self._update_thread.join(timeout=2)
+        logger.info("持仓盈亏更新线程已停止。")
     
-    def _calculate_risk_based_lot_size(self, follower_name: str, event: DealAddEvent, 
-                                     follower_config: dict, symbol_info, master_point: float) -> Optional[float]:
-        """
-        根据风险百分比计算交易手数。
-        
-        Args:
-            follower_name: 跟单账户名称
-            event: 交易事件
-            follower_config: 账户配置
-            symbol_info: 跟单账户的交易品种信息
-            master_point: 主账户交易品种的点值
+    def _profit_update_loop(self):
+        while self._running_update_thread:
+            try:
+                self._update_all_positions_profit()
+            except Exception as e:
+                logger.error(f"更新持仓盈亏时发生意外错误: {e}", exc_info=True)
             
-        Returns:
-            计算出的手数，如果无法计算则返回 None
-        """
-        account_info = self.account_manager.get_account_info(follower_name)
-        if not account_info:
-            logger.warning(f"跟单账户 {follower_name}: 无法获取账户信息。")
-            return None
-            
-        balance = account_info.balance
-        risk_percentage = follower_config.get("risk_percentage", 0.01)  # 默认 1%
-        
-        # 检查止损是否设置
-        if event.sl <= 0 or event.price <= 0:
-            lot_size = follower_config.get("lot_value", 0.01)
-            logger.warning(f"跟单账户 {follower_name}: 无止损，使用固定手数 {lot_size}。")
-            return lot_size
-            
-        # 计算风险金额
-        risk_amount = balance * risk_percentage
-        
-        # 计算止损距离（以点为单位）
-        sl_distance_price = abs(event.price - event.sl)
-        sl_distance_points = sl_distance_price / symbol_info.point
-        
-        if sl_distance_points <= 0:
-            logger.warning(f"跟单账户 {follower_name}: 止损距离为零，无法计算风险手数。")
-            return follower_config.get("lot_value", 0.01)
-            
-        # 获取每手每点的价值
-        # 使用 tick_value 和 tick_size 来计算每点价值
-        point_value_per_lot = (symbol_info.point / symbol_info.tick_size) * symbol_info.tick_value
-        
-        # 对于某些品种（如指数），可能需要使用合约规模
-        contract_size = getattr(symbol_info, 'trade_contract_size', 100000)
-        
-        # 计算每手的风险金额
-        risk_per_lot = sl_distance_points * point_value_per_lot
-        
-        if risk_per_lot <= 0:
-            logger.warning(f"跟单账户 {follower_name}: 每手风险计算为零或负数。")
-            return follower_config.get("lot_value", 0.01)
-            
-        # 计算手数
-        lot_size = risk_amount / risk_per_lot
-        
-        # 标准化手数
-        lot_size = self._normalize_lot_size(lot_size, symbol_info)
-        
-        logger.info(f"跟单账户 {follower_name}: 基于 {risk_percentage*100:.2f}% 风险计算的手数为 {lot_size:.2f}。"
-                   f" (风险金额: {risk_amount:.2f}, 止损距离: {sl_distance_points:.1f} 点)")
-        
-        return lot_size
-        
-    def _normalize_lot_size(self, lot_size: float, symbol_info) -> float:
-        """
-        标准化手数以符合交易品种的要求。
-        
-        Args:
-            lot_size: 原始手数
-            symbol_info: 交易品种信息
-            
-        Returns:
-            标准化后的手数
-        """
-        # 确保手数在允许范围内
-        lot_size = max(symbol_info.volume_min, min(lot_size, symbol_info.volume_max))
-        
-        # 调整手数以符合步进大小
-        volume_step = symbol_info.volume_step
-        if volume_step > 0:
-            lot_size = round(lot_size / volume_step) * volume_step
-            
-        return lot_size
+            update_interval = self.config_manager.get_setting("engine.profit_update_interval_seconds", 5)
+            time.sleep(update_interval)
 
-    def _get_symbol_info(self, follower_name: str, symbol: str) -> Optional[Any]:
-        """
-        安全地获取交易品种信息，如果需要，会自动尝试启用该品种。
-        如果无法获取品种信息，会返回一个默认的品种信息对象，以确保交易流程不会中断。
-        """
-        # 获取跟单账户配置
-        follower_config = self.config_manager.get_follower_config(follower_name)
-        if not follower_config:
-            logger.warning(f"无法获取账户 {follower_name} 的配置")
-            return None
-            
-        # 检查该账户的品种映射
-        symbol_mapping = follower_config.get("symbol_mapping", {})
-        # 查看主品种到跟单品种的映射
-        mapped_symbol = symbol_mapping.get(symbol, symbol)
-        if mapped_symbol != symbol:
-            logger.info(f"跟单账户 {follower_name}: 品种 {symbol} 已映射到 {mapped_symbol}")
-            symbol = mapped_symbol
-
-        # 第一次尝试获取映射后的品种信息
-        info = mt5.symbol_info(symbol)
-        if info:
-            logger.debug(f"跟单账户 {follower_name}: 成功获取 {symbol} 的信息")
-            return info
-
-        # 如果失败，尝试启用该品种并重试
-        logger.warning(f"跟单账户 {follower_name}: 无法直接获取 {symbol} 的信息，尝试启用它...")
-        if mt5.symbol_select(symbol, True):
-            # 等待一小段时间让终端处理请求
-            time.sleep(0.1) 
-            info = mt5.symbol_info(symbol)
-            if info:
-                logger.info(f"跟单账户 {follower_name}: 成功启用并获取了 {symbol} 的信息。")
-                return info
-        
-        # 如果仍然失败，检查是否有备用的映射方案或格式不同的相同品种
-        logger.warning(f"跟单账户 {follower_name}: 无法获取交易品种 {symbol} 的信息，尝试查找替代品种...")
-        
-        # 尝试从终端获取所有可交易品种
-        available_symbols = mt5.symbols_get()
-        if available_symbols:
-            available_symbol_names = [s.name for s in available_symbols]
-            logger.debug(f"跟单账户 {follower_name}: 可用交易品种: {', '.join(available_symbol_names[:10])}...")
-            
-            # 检查品种是否有不同的大小写或格式版本
-            symbol_lower = symbol.lower()
-            for avail_sym in available_symbol_names:
-                if avail_sym.lower() == symbol_lower:
-                    logger.info(f"跟单账户 {follower_name}: 找到大小写不同的品种 {avail_sym}，将使用它代替 {symbol}")
-                    info = mt5.symbol_info(avail_sym)
-                    if info:
-                        return info
-        
-        logger.error(f"跟单账户 {follower_name}: 无法获取交易品种 {symbol} 的信息，即使在多次尝试后。")
-        logger.error(f"请确保在账户配置中正确设置了品种映射，或检查该品种是否存在于您的经纪商处。")
-        
-        # 返回一个基本的默认品种信息对象，防止系统崩溃
-        # 注意：这只是一个应急方案，实际交易将可能出错
-        from types import SimpleNamespace
-        default_info = SimpleNamespace()
-        default_info.name = symbol
-        default_info.point = 0.00001  # 默认点值，通常适用于外汇对
-        default_info.volume_min = 0.01
-        default_info.volume_max = 100.0
-        default_info.volume_step = 0.01
-        default_info.tick_size = 0.00001
-        default_info.tick_value = 1.0
-        logger.warning(f"跟单账户 {follower_name}: 使用默认品种信息进行交易。这可能导致交易错误。")
-        
-        return default_info
-
-    def process_event(self, event_data: Dict[str, Any]):
-        """
-        处理来自上游的单个交易事件字典。
-        它会验证负载，将其转换为强类型的事件模型，然后分派到相应的处理程序。
-        """
-        try:
-            event_type = event_data.get("event_type")
-            if not event_type:
-                logger.warning(f"接收到缺少 event_type 的事件: {event_data}")
-                return
-
-            logger.debug(f"正在处理事件类型: {event_type}, 数据: {event_data}")
-
-            handler = self.event_handlers.get(event_type)
-            if handler:
-                # Pydantic models will raise validation error if data is bad
-                if event_type == "DEAL_ADD":
-                    handler(DealAddEvent(**event_data))
-                elif event_type in ("ORDER_ADD", "ORDER_UPDATE", "ORDER_DELETE"):
-                    handler(OrderEvent(**event_data))
-                elif event_type == "POSITION_MODIFY":
-                    handler(PositionModifyEvent(**event_data))
-            else:
-                logger.warning(f"未知事件类型 '{event_type}'，正在忽略。")
-
-        except Exception as e: # 在Pydantic模型验证失败时也会捕捉到
-            logger.error(f"处理事件时发生错误: {e}", exc_info=True)
-
-    def _handle_deal_add(self, event: DealAddEvent):
-        """处理新的成交事件。"""
+    @handle_exceptions(category=ErrorCategory.TRANSIENT)
+    def _update_all_positions_profit(self):
         with self.lock:
-            # 对于反向 (INOUT) 交易，我们必须先平仓现有仓位，然后开立新仓位。
-            if event.entry == "INOUT":
-                logger.info(f"正在处理反向 (INOUT) 仓位: deal={event.ticket}, position={event.position_id}")
-                # 首先平仓旧仓位，使用合成平仓事件
-                self._close_positions(event)
-                # 然后开立新仓位
-                self._open_positions(event)
+            if not self.position_map:
+                return # 没有持仓需要更新
 
-            elif event.entry == "IN":
-                logger.info(f"正在处理开仓: deal={event.ticket}, position={event.position_id}")
-                self._open_positions(event)
+            required_positions = {}
+            for master_pos in self.position_map.values():
+                for follower_name, follower_pos in master_pos.followers.items():
+                    if follower_name not in required_positions:
+                        required_positions[follower_name] = []
+                    required_positions[follower_name].append(follower_pos.ticket)
 
-            elif event.entry in ["OUT", "OUT_BY"]:
-                logger.info(f"正在处理平仓: deal={event.ticket}, position={event.position_id}")
-                self._close_positions(event)
-            
-            else:
-                logger.warning(f"交易 {event.ticket} 的交易入场类型 '{event.entry}' 不受支持。")
-                
-        # 更新GUI持仓信息
-        self.update_positions()
-
-    def _handle_order_add(self, event: OrderEvent):
-        # 处理 ORDER_ADD 事件 - 新订单（市价单或挂单）。
-        # 对于状态为 "STARTED" 的市价单，我们通常等待 DEAL_ADD 事件。
-        # 对于挂单，我们需要创建相应的挂单。
-        if event.state == "PLACED" and event.price_open > 0:
-            # 这是一个挂单
-            self._handle_new_pending_order(event)
-        # 状态为 "STARTED" 的市价单将由 DEAL_ADD 处理
-
-    def _handle_order_update(self, event: OrderEvent):
-        """处理 ORDER_UPDATE 事件 - 修改现有订单。"""
-        # 同样，只关心挂单的修改
-        if event.type in ("BUY_LIMIT", "SELL_LIMIT", "BUY_STOP", "SELL_STOP", "BUY_STOP_LIMIT", "SELL_STOP_LIMIT"):
-            self._handle_modify_pending_order(event)
-
-    def _handle_order_delete(self, event: OrderEvent):
-        """处理 ORDER_DELETE 事件 - 订单取消。"""
-        if event.type in ("BUY_LIMIT", "SELL_LIMIT", "BUY_STOP", "SELL_STOP", "BUY_STOP_LIMIT", "SELL_STOP_LIMIT"):
-            self._handle_delete_pending_order(event)
-
-    def _handle_position_modify(self, event: PositionModifyEvent):
-        """处理止损/止盈修改事件。"""
-        with self.lock:
-            master_position_id_str = str(event.position_id)
-            follower_positions = self.position_map.get(master_position_id_str, {})
-
-            if not follower_positions:
-                logger.info(f"未找到主仓位 {master_position_id_str} 的跟单仓位进行修改。")
+            if not required_positions:
                 return
 
-            # 获取主账户交易品种的点值
-            master_symbol_info = mt5.symbol_info(event.symbol)
-            if not master_symbol_info:
-                logger.error(f"无法获取主账户品种 {event.symbol} 的信息")
-                return
-            master_point = master_symbol_info.point
+        # 并行获取所有持仓的最新信息
+        all_positions_info = {}
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            future_to_follower = {}
+            for name, tickets in required_positions.items():
+                for ticket in tickets:
+                    future = executor.submit(self.account_manager.get_positions, name, ticket)
+                    future_to_follower[future] = (name, ticket)
 
-            for follower_name, follower_position_id in follower_positions.items():
+            for future in concurrent.futures.as_completed(future_to_follower):
+                name, ticket = future_to_follower[future]
                 try:
-                    follower_config = self.config_manager.get_follower_config(follower_name)
-                    
-                    # 检查是否同步SL/TP
-                    if not follower_config.get("copy_sl_tp", True):
-                        logger.info(f"跟单账户 {follower_name} 配置为不同步SL/TP，跳过修改")
-                        continue
-                    
-                    # 获取跟单账户持仓信息
-                    follower_positions_info = mt5.positions_get(ticket=follower_position_id)
-                    if not follower_positions_info:
-                        logger.warning(f"跟单账户 {follower_name}: 无法获取持仓 {follower_position_id} 的信息")
-                        continue
-                        
-                    follower_position = follower_positions_info[0]
-                    follower_symbol = follower_position.symbol
-                    follower_symbol_info = mt5.symbol_info(follower_symbol)
-                    if not follower_symbol_info:
-                        logger.warning(f"跟单账户 {follower_name}: 无法获取品种 {follower_symbol} 的信息")
-                        continue
-                        
-                    follower_point = follower_symbol_info.point
-                    
-                    # 计算点值比率用于调整SL/TP
-                    point_ratio = follower_point / master_point if master_point > 0 else 1.0
-                    
-                    new_sl = 0
-                    new_tp = 0
-                    
-                    # 根据跟单策略计算新的SL/TP
-                    if follower_config.get("reverse_trades", False):
-                        # 反向跟单 - 需要"镜像"计算SL/TP
-                        new_sl, new_tp = self._calculate_reversed_sl_tp(
-                            follower_position.type, 
-                            follower_position.price_open,
-                            event.sl, 
-                            event.tp, 
-                            point_ratio
-                        )
-                    else:
-                        # 正向跟单 - 保持相对距离
-                        # 如果主账户有止损
-                        if event.sl > 0:
-                            # 计算主账户止损点数距离
-                            if event.type == "BUY":
-                                # 买入: 止损在下方
-                                master_sl_points = (event.price_open - event.sl) / master_point
-                                new_sl = follower_position.price_open - (master_sl_points * follower_point)
-                            else:
-                                # 卖出: 止损在上方
-                                master_sl_points = (event.sl - event.price_open) / master_point
-                                new_sl = follower_position.price_open + (master_sl_points * follower_point)
-                        
-                        # 如果主账户有止盈
-                        if event.tp > 0:
-                            # 计算主账户止盈点数距离
-                            if event.type == "BUY":
-                                # 买入: 止盈在上方
-                                master_tp_points = (event.tp - event.price_open) / master_point
-                                new_tp = follower_position.price_open + (master_tp_points * follower_point)
-                            else:
-                                # 卖出: 止盈在下方
-                                master_tp_points = (event.price_open - event.tp) / master_point
-                                new_tp = follower_position.price_open - (master_tp_points * follower_point)
-                    
-                    # 构建修改请求
-                    request = {
-                        "action": mt5.TRADE_ACTION_SLTP,
-                        "position": follower_position_id,
-                        "sl": new_sl,
-                        "tp": new_tp,
-                        "magic": self.config_manager.EA_MAGIC
-                    }
-                    
-                    # 执行请求
-                    result = self.account_manager.execute_single_trade(follower_name, request)
-                    
-                    if result and result.get("status") == "success":
-                        logger.info(f"跟单账户 {follower_name}: 成功修改持仓 {follower_position_id} 的SL/TP")
-                    else:
-                        logger.error(f"跟单账户 {follower_name}: 修改持仓 {follower_position_id} 的SL/TP失败: {result}")
-                        
+                    result = future.result()
+                    if result and result.get('status') == 'success' and result.get('positions'):
+                        if name not in all_positions_info:
+                            all_positions_info[name] = {}
+                        all_positions_info[name][ticket] = result['positions'][0]
                 except Exception as e:
-                    logger.error(f"跟单账户 {follower_name}: 修改SL/TP时发生错误: {e}", exc_info=True)
-            
-            # 更新GUI持仓信息
-            self.update_positions()
+                    logger.warning(f"获取账户 {name} 上的持仓 {ticket} 利润时出错: {e}")
 
-    def _handle_new_pending_order(self, event: OrderEvent):
-        # 处理新的挂单事件。为每个跟单账户构建挂单请求。
-        trade_requests = self._build_pending_order_requests(event, "ADD")
-        if not trade_requests:
-            logger.info("未生成新挂单请求。")
+        # 使用获取的信息更新内部状态
+        with self.lock:
+            profit_changed = False
+            for master_pos in self.position_map.values():
+                for follower_name, follower_pos in master_pos.followers.items():
+                    pos_info = all_positions_info.get(follower_name, {}).get(follower_pos.ticket)
+                    if pos_info:
+                        new_profit = pos_info.get('profit', 0.0)
+                        if follower_pos.profit != new_profit:
+                            follower_pos.profit = new_profit
+                            profit_changed = True
+            
+            # 主账户的利润可以被视为所有跟单账户利润的总和，或者另外获取
+            # 为简单起见，我们暂时不聚合主账户利润
+        
+        if profit_changed:
+            self._notify_state_change()
+
+    # 注册一个回调函数，当状态映射变化时调用
+    def register_position_update_callback(self, callback: Callable[[List[Dict]], None]):
+        with self.lock:
+            self.position_update_callback = callback
+
+    # 当外部源（如EA握手）提供完整状态时，同步内部状态
+    def sync_state(self, state_data: Dict[str, Any]):
+        # 注意: 此函数需要适配新的MasterPosition结构，或者在EA端进行调整
+        # 目前，我们将简单地清除现有状态，因为它与EA的格式不兼容
+        with self.lock:
+            self.position_map.clear()
+            self.pending_order_map = state_data.get("pending_order_map", {}) # 挂单逻辑保持不变
+            logger.info(f"交易状态已与外部源同步。清空了现有持仓映射。")
+            self._save_state_to_disk()
+            self._notify_state_change()
+
+    # 获取用于UI显示的当前状态
+    def get_display_state(self) -> List[Dict[str, Any]]:
+        with self.lock:
+            display_list = []
+            for master_pos in self.position_map.values():
+                display_list.append({
+                    "master_symbol": master_pos.symbol,
+                    "master_ticket": master_pos.ticket,
+                    "master_type": master_pos.type,
+                    "master_volume": master_pos.volume,
+                    "master_profit": master_pos.profit,
+                    "follower_positions": {
+                        name: {
+                            "ticket": f_pos.ticket,
+                            "type": f_pos.type,
+                            "volume": f_pos.volume,
+                            "profit": f_pos.profit,
+                        } for name, f_pos in master_pos.followers.items()
+                    }
+                })
+            return display_list
+
+    # 获取主账户信息 - 新增方法
+    def get_master_account_info(self) -> Dict[str, Any]:
+        """获取主账户信息"""
+        master_config = self.config_manager.get_master_account()
+        if not master_config:
+            return {"name": "主账户", "balance": 0.0, "equity": 0.0, "margin": 0.0}
+            
+        # 尝试从第一个跟单账户获取主账户信息
+        enabled_followers = self.config_manager.get_enabled_follower_configs()
+        if not enabled_followers:
+            return {"name": "主账户", "balance": 0.0, "equity": 0.0, "margin": 0.0}
+            
+        # 获取主账户持仓总数
+        position_count = len(self.position_map)
+        
+        # 计算主账户总盈亏
+        total_profit = 0.0
+        for pos in self.position_map.values():
+            total_profit += pos.profit
+            
+        return {
+            "name": master_config.get("name", "主账户"),
+            "balance": 0.0,  # 这些信息需要从EA获取
+            "equity": 0.0,
+            "margin": 0.0,
+            "position_count": position_count,
+            "total_profit": total_profit
+        }
+
+    # 获取格式化的持仓列表用于UI显示
+    def get_formatted_positions(self) -> List[Dict[str, Any]]:
+        with self.lock:
+            formatted_positions = []
+            for master_pos in self.position_map.values():
+                position_data = {
+                    "master_ticket": master_pos.ticket,
+                    "symbol": master_pos.symbol,
+                    "type": master_pos.type,
+                    "volume": master_pos.volume,
+                    "profit": master_pos.profit,
+                    "open_price": master_pos.open_price,
+                    "followers": {}
+                }
+                
+                # 添加跟单账户的持仓信息
+                for follower_name, follower_pos in master_pos.followers.items():
+                    position_data["followers"][follower_name] = {
+                        "ticket": follower_pos.ticket,
+                        "volume": follower_pos.volume,
+                        "type": follower_pos.type,
+                        "profit": follower_pos.profit,
+                        "open_price": follower_pos.open_price
+                    }
+                
+                formatted_positions.append(position_data)
+            
+            return formatted_positions
+
+    # 通知GUI状态已更新
+    def _notify_state_change(self):
+        if self.position_update_callback:
+            try:
+                display_state = self.get_display_state()
+                self.position_update_callback(display_state)
+            except Exception as e:
+                logger.error(f"调用位置更新回调时出错: {e}", exc_info=True)
+
+    # 从JSON文件加载交易状态
+    @handle_exceptions(category=ErrorCategory.PERMANENT)
+    def _load_state_from_disk(self):
+        state_file = self.config_manager.get_setting("state_file", "trade_state.json")
+        if os.path.exists(state_file):
+            try:
+                with open(state_file, 'r') as f:
+                    state = json.load(f)
+                
+                self.position_map = {}
+                raw_pos_map = state.get("position_map", {})
+                for k, v in raw_pos_map.items():
+                    follower_data = v.pop("followers", {})
+                    master_pos = MasterPosition(**v)
+                    master_pos.followers = {
+                        fname: FollowerPosition(**f_data)
+                        for fname, f_data in follower_data.items()
+                    }
+                    self.position_map[int(k)] = master_pos
+
+                self.pending_order_map = state.get("pending_order_map", {})
+                logger.info(f"已成功从磁盘加载交易状态。找到 {len(self.position_map)} 个映射仓位。")
+            except (json.JSONDecodeError, IOError, TypeError) as e:
+                logger.error(f"从磁盘加载交易状态失败，将以空状态开始: {e}")
+                self.position_map = {}
+        else:
+            logger.info("未找到交易状态文件，将以全新状态启动。")
+
+    # 将当前交易状态保存到JSON文件
+    @handle_exceptions(category=ErrorCategory.PERMANENT)
+    def _save_state_to_disk(self):
+        state_file = self.config_manager.get_setting("state_file", "trade_state.json")
+        try:
+            with self.lock:
+                serializable_pos_map = {}
+                for k, v in self.position_map.items():
+                    master_pos_dict = v.__dict__.copy()
+                    master_pos_dict['followers'] = {
+                        fname: f_pos.__dict__ for fname, f_pos in v.followers.items()
+                    }
+                    serializable_pos_map[k] = master_pos_dict
+
+                state = { "position_map": serializable_pos_map, "pending_order_map": self.pending_order_map }
+                with open(state_file, 'w') as f:
+                    json.dump(state, f, indent=4)
+        except (IOError, TypeError) as e:
+            logger.error(f"保存交易状态到磁盘失败: {e}")
+        
+        self._notify_state_change()
+
+    # 处理单个交易事件
+    @handle_exceptions(category=ErrorCategory.PERMANENT)
+    def process_event(self, event: BaseEvent):
+        with self.lock:
+            handler = self.event_handlers.get(event.event_type)
+            if handler:
+                try:
+                    handler(event) # Directly pass the validated event object
+                except Exception as e:
+                    logger.error(f"处理事件 {event.event_type} 时出错: {e}", exc_info=True)
+            else:
+                logger.warning(f"未找到事件类型 '{event.event_type}' 的处理器。")
+
+    # 处理新的市价成交事件
+    def _handle_new_deal(self, event: DealAddEvent):
+        if event.magic != self.config_manager.get_setting("magic_number", 12345): 
+            logger.debug(f"忽略非系统魔术数字的交易事件: {event.magic}")
             return
 
-        results = self.account_manager.execute_trades_parallel(trade_requests)
-
+        master_position_id = event.position_id
+        is_open = event.entry == 'IN'
+        
+        logger.info(f"处理{'开仓' if is_open else '平仓'}事件: ID={master_position_id}, 品种={event.symbol}, 类型={event.type}, 手数={event.volume}")
+        
         with self.lock:
-            for name, result in results.items():
-                if result and result.get("status") == "success":
-                    follower_order_ticket = result["result"].order
-                    self.pending_order_map[str(event.ticket)] = self.pending_order_map.get(str(event.ticket), {})
-                    self.pending_order_map[str(event.ticket)][name] = follower_order_ticket
+            if is_open:
+                if master_position_id in self.position_map:
+                    logger.warning(f"忽略重复的开仓事件: 主账户持仓ID {master_position_id} 已存在")
+                    return
+                
+                logger.info(f"处理新开仓事件: 主账户持仓ID {master_position_id}")
+                
+                master_pos = MasterPosition(
+                    ticket=master_position_id, symbol=event.symbol, volume=event.volume,
+                    type=event.type, profit=event.profit, open_price=event.price
+                )
+                self.position_map[master_position_id] = master_pos
+                
+                requests = self._build_trade_requests(event, is_open=True)
+                if not requests:
+                    logger.warning(f"未能为持仓 {master_position_id} 构建任何交易请求，从映射中移除")
+                    del self.position_map[master_position_id]
+                    return
+
+                logger.info(f"为新持仓 {master_position_id} 异步分发 {len(requests)} 个开仓请求")
+                self.account_manager.execute_trades_parallel(list(requests.values()))
+                self._save_state_to_disk() # 保存初始主仓位状态
+                logger.info(f"成功分发开仓请求，主账户持仓ID: {master_position_id}")
+            
+            else: # 平仓逻辑
+                logger.info(f"处理平仓事件: 主账户持仓ID {master_position_id}")
+                
+                master_pos = self.position_map.get(master_position_id)
+                if not master_pos:
+                    logger.warning(f"忽略平仓事件，主账户持仓ID {master_position_id} 不存在")
+                    return
+
+                follower_positions = {name: pos.ticket for name, pos in master_pos.followers.items()}
+                
+                if not follower_positions:
+                    logger.warning(f"主持仓 {master_position_id} 没有关联的跟单持仓，无需平仓")
+                    del self.position_map[master_position_id]
                     self._save_state_to_disk()
-                    logger.info(f"为 {name} 成功创建挂单 {follower_order_ticket} 并保存状态。")
-                else:
-                    logger.error(f"为 {name} 创建挂单失败: {result}")
+                    return
+                    
+                requests = self._build_trade_requests(event, is_open=False, follower_positions=follower_positions)
+                
+                if not requests: 
+                    logger.warning(f"未能为持仓 {master_position_id} 构建任何平仓请求")
+                    return
 
-    def _handle_modify_pending_order(self, event: OrderEvent):
-        # 处理修改现有挂单的事件。需要实现更高级的逻辑来判断是否是价格、SL/TP 或其他修改。
+                results = self.account_manager.execute_trades_parallel(list(requests.values()))
+                
+                for follower_name, result in results.items():
+                    if result and result.get('status') == 'success':
+                        logger.info(f"[{follower_name}] 平仓成功: master_id={master_position_id}")
+                        if master_position_id in self.position_map:
+                            if follower_name in self.position_map[master_position_id].followers:
+                                del self.position_map[master_position_id].followers[follower_name]
+                            if not self.position_map[master_position_id].followers:
+                                del self.position_map[master_position_id]
+                    else:
+                        retcode = result.get('payload', {}).get('result', {}).get('retcode')
+                        error_msg = result.get('payload', {}).get('result', {}).get('comment', f'retcode={retcode}')
+                        logger.error(f"[{follower_name}] 平仓失败: {error_msg}")
+                
+                self._save_state_to_disk()
+
+    # 处理止损/止盈修改事件
+    def _handle_position_modify(self, event: PositionModifyEvent):
+        master_position_id = event.ticket
+        logger.info(f"处理持仓修改事件: 主账户持仓ID {master_position_id}")
         with self.lock:
-            master_position_id = str(event.ticket)
-            follower_positions = self.position_map.get(master_position_id, {})
-
-            if not follower_positions:
-                logger.info(f"未找到主仓位 {master_position_id} 的跟单仓位进行修改。")
+            master_pos = self.position_map.get(master_position_id)
+            if not master_pos:
+                logger.warning(f"无法找到要修改的持仓 {master_position_id}")
                 return
+            follower_positions = {name: pos.ticket for name, pos in master_pos.followers.items()}
+        
+        if not follower_positions:
+            logger.info(f"持仓 {master_position_id} 没有跟单者，无需修改")
+            return
 
-            # 获取主账户交易品种的点值
-            master_symbol_info = mt5.symbol_info(event.symbol)
-            if not master_symbol_info:
-                logger.error(f"无法获取主账户品种 {event.symbol} 的信息")
-                return
-            master_point = master_symbol_info.point
+        requests = self._build_modify_requests(event, follower_positions)
+        if requests:
+            logger.info(f"为 {len(requests)} 个跟单持仓构建了修改请求")
+            self.account_manager.execute_trades_parallel(requests)
 
-            for follower_name, follower_position_id in follower_positions.items():
-                try:
-                    follower_config = self.config_manager.get_follower_config(follower_name)
-                    
-                    # 检查是否同步SL/TP
-                    if not follower_config.get("copy_sl_tp", True):
-                        logger.info(f"跟单账户 {follower_name} 配置为不同步SL/TP，跳过修改")
-                        continue
-                    
-                    # 获取跟单账户持仓信息
-                    follower_positions_info = mt5.positions_get(ticket=follower_position_id)
-                    if not follower_positions_info:
-                        logger.warning(f"跟单账户 {follower_name}: 无法获取持仓 {follower_position_id} 的信息")
-                        continue
-                        
-                    follower_position = follower_positions_info[0]
-                    follower_symbol = follower_position.symbol
-                    follower_symbol_info = mt5.symbol_info(follower_symbol)
-                    if not follower_symbol_info:
-                        logger.warning(f"跟单账户 {follower_name}: 无法获取品种 {follower_symbol} 的信息")
-                        continue
-                        
-                    follower_point = follower_symbol_info.point
-                    
-                    # 计算点值比率用于调整SL/TP
-                    point_ratio = follower_point / master_point if master_point > 0 else 1.0
-                    
-                    new_sl = 0
-                    new_tp = 0
-                    
-                    # 根据跟单策略计算新的SL/TP
-                    if follower_config.get("reverse_trades", False):
-                        # 反向跟单 - 需要"镜像"计算SL/TP
-                        new_sl, new_tp = self._calculate_reversed_sl_tp(
-                            follower_position.type, 
-                            follower_position.price_open,
-                            event.sl, 
-                            event.tp, 
-                            point_ratio
-                        )
-                    else:
-                        # 正向跟单 - 保持相对距离
-                        # 如果主账户有止损
-                        if event.sl > 0:
-                            # 计算主账户止损点数距离
-                            if event.type == "BUY":
-                                # 买入: 止损在下方
-                                master_sl_points = (event.price_open - event.sl) / master_point
-                                new_sl = follower_position.price_open - (master_sl_points * follower_point)
-                            else:
-                                # 卖出: 止损在上方
-                                master_sl_points = (event.sl - event.price_open) / master_point
-                                new_sl = follower_position.price_open + (master_sl_points * follower_point)
-                        
-                        # 如果主账户有止盈
-                        if event.tp > 0:
-                            # 计算主账户止盈点数距离
-                            if event.type == "BUY":
-                                # 买入: 止盈在上方
-                                master_tp_points = (event.tp - event.price_open) / master_point
-                                new_tp = follower_position.price_open + (master_tp_points * follower_point)
-                            else:
-                                # 卖出: 止盈在下方
-                                master_tp_points = (event.price_open - event.tp) / master_point
-                                new_tp = follower_position.price_open - (master_tp_points * follower_point)
-                    
-                    # 构建修改请求
-                    request = {
-                        "action": mt5.TRADE_ACTION_SLTP,
-                        "position": follower_position_id,
-                        "sl": new_sl,
-                        "tp": new_tp,
-                        "magic": self.config_manager.EA_MAGIC
-                    }
-                    
-                    # 执行请求
-                    result = self.account_manager.execute_single_trade(follower_name, request)
-                    
-                    if result and result.get("status") == "success":
-                        logger.info(f"跟单账户 {follower_name}: 成功修改持仓 {follower_position_id} 的SL/TP")
-                    else:
-                        logger.error(f"跟单账户 {follower_name}: 修改持仓 {follower_position_id} 的SL/TP失败: {result}")
-                        
-                except Exception as e:
-                    logger.error(f"跟单账户 {follower_name}: 修改SL/TP时发生错误: {e}", exc_info=True)
-
-    def _handle_delete_pending_order(self, event: OrderEvent):
-        # 处理删除挂单事件。
+    # 处理新的挂单事件
+    def _handle_new_pending_order(self, event: OrderEvent):
+        logger.info(f"处理新挂单事件 (功能暂未完全实现): {event.ticket}")
+        requests = self._build_pending_order_requests(event, "ADD")
+        if not requests: return
+        
+        # This part should be async in the future
+        results = self.account_manager.execute_trades_parallel(list(requests.values()))
         with self.lock:
             master_order_id = str(event.ticket)
-            follower_orders = self.pending_order_map.pop(master_order_id, {})
-
-            if not follower_orders:
-                logger.info(f"未找到主订单 {master_order_id} 的跟单挂单进行删除。")
-                return
-
-            trade_requests = self._build_pending_order_requests(event, "DELETE", follower_orders)
-            if not trade_requests:
-                logger.info("未生成删除挂单请求。")
-                return
-
-            results = self.account_manager.execute_trades_parallel(trade_requests)
-
+            self.pending_order_map[master_order_id] = {}
             for name, result in results.items():
                 if result and result.get("status") == "success":
-                    logger.info(f"为 {name} 成功删除挂单。")
-                else:
-                    logger.error(f"为 {name} 删除挂单失败: {result}")
-
+                    res_payload = result.get('payload', {})
+                    if res_payload and res_payload.get('result'):
+                        self.pending_order_map[master_order_id][name] = res_payload['result'].get('order')
             self._save_state_to_disk()
-            logger.info(f"已为所有跟单账户删除挂单 {master_order_id} 并保存状态。")
 
-    def _open_positions(self, event: DealAddEvent):
-        # 处理跟单账户的开仓。包括风险管理和滑点控制。
-        # 1. 构建请求（此方法现在需要更智能）
-        trade_requests = self._build_trade_requests(event, is_open=True)
-        if not trade_requests:
-            logger.info("未生成交易请求。")
-            return
-
-        # 2. 执行交易
-        results = self.account_manager.execute_trades_parallel(trade_requests)
-
-        # 3. 处理结果，检查滑点，并更新映射
+    # 处理挂单修改事件
+    def _handle_modify_pending_order(self, event: OrderEvent):
+        logger.info(f"处理挂单修改事件 (功能暂未完全实现): {event.ticket}")
+        master_order_id = str(event.ticket)
         with self.lock:
-            master_position_id_str = str(event.position_id)
-            logger.debug(f"主账户开仓: position_id={master_position_id_str}, symbol={event.symbol}, volume={event.volume}")
-            
-            # 确保在字典中有该主仓位的条目
-            if master_position_id_str not in self.position_map:
-                self.position_map[master_position_id_str] = {}
-                
-            for name, result in results.items():
-                if result and result.get("status") == "success":
-                    follower_result = result["result"]
-                    # 滑点检查
-                    follower_config = self.config_manager.get_follower_config(name)
-                    max_slippage = follower_config.get("max_slippage_pips", 3) if follower_config else 3
-                    
-                    # 获取订单号
-                    follower_position_id = follower_result.order
-                    
-                    # 确保订单号有效
-                    if follower_position_id > 0:
-                        # 更新映射并保存状态
-                        self.position_map[master_position_id_str][name] = follower_position_id
-                        logger.info(f"为 {name} 成功开仓 {follower_position_id} 并映射到主仓位 {master_position_id_str}")
-                    else:
-                        logger.warning(f"跟单账户 {name} 的订单号无效: {follower_position_id}")
-                        
-                    # 保存状态到磁盘
+            follower_orders = self.pending_order_map.get(master_order_id)
+            if not follower_orders: return
+        requests = self._build_pending_order_requests(event, "MODIFY", follower_orders)
+        if requests:
+            self.account_manager.execute_trades_parallel(list(requests.values()))
+
+    # 处理挂单移除事件
+    def _handle_remove_pending_order(self, event: OrderEvent):
+        logger.info(f"处理挂单移除事件 (功能暂未完全实现): {event.ticket}")
+        master_order_id = str(event.ticket)
+        with self.lock:
+            follower_orders = self.pending_order_map.get(master_order_id)
+            if not follower_orders: return
+        
+        requests = self._build_pending_order_requests(event, "DELETE", follower_orders)
+        if requests:
+            self.account_manager.execute_trades_parallel(list(requests.values()))
+            with self.lock:
+                if master_order_id in self.pending_order_map:
+                    del self.pending_order_map[master_order_id]
                     self._save_state_to_disk()
-                    
-                    # 记录当前映射状态，用于调试
-                    logger.debug(f"当前持仓映射: {self.position_map}")
-                else:
-                    error_msg = result.get("message", "未知错误") if result else "交易结果为空"
-                    logger.error(f"为 {name} 开仓失败: {error_msg}")
-                    
-            # 更新GUI持仓信息
-            self.update_positions()
 
-    def _close_positions(self, event: DealAddEvent):
-        # 处理跟单账户的平仓。
-        # Args:
-        #     event: DealAddEvent (或包含 position_id 的任何事件)
-        with self.lock:
-            master_position_id = str(event.position_id)
-            logger.debug(f"主账户平仓: position_id={master_position_id}, symbol={event.symbol}, volume={event.volume}")
-            logger.debug(f"当前持仓映射: {self.position_map}")
-            
-            # 获取并移除映射中的跟单仓位
-            follower_positions = self.position_map.pop(master_position_id, {})
-
-            if not follower_positions:
-                logger.warning(f"未找到主仓位 {master_position_id} 的跟单仓位进行平仓。可能的原因：")
-                logger.warning(f"1. 该主仓位未被成功复制")
-                logger.warning(f"2. 仓位映射丢失或未正确保存")
-                logger.warning(f"3. 该仓位已经被平仓")
-                return
-
-            logger.info(f"找到主仓位 {master_position_id} 的 {len(follower_positions)} 个跟单仓位需要平仓: {follower_positions}")
-            
-            # 构建平仓请求
-            trade_requests = {}
-            
-            # 对每个跟单账户单独处理
-            for follower_name, follower_position_id in follower_positions.items():
-                # 获取跟单账户的连接
-                mt5_conn = self.account_manager._get_connection(follower_name)
-                if not mt5_conn:
-                    logger.error(f"无法连接到跟单账户 {follower_name} 进行平仓")
-                    continue
-                
-                try:
-                    # 直接获取跟单仓位信息
-                    position_info = mt5_conn.positions_get(ticket=follower_position_id)
-                    
-                    if not position_info:
-                        logger.warning(f"跟单账户 {follower_name}: 无法获取仓位 {follower_position_id} 的信息，可能已被手动平仓")
-                        continue
-                    
-                    # 获取仓位信息成功，构建平仓请求
-                    position = position_info[0]
-                    
-                    # 获取交易品种信息
-                    symbol_info = mt5_conn.symbol_info(position.symbol)
-                    if not symbol_info:
-                        logger.warning(f"跟单账户 {follower_name}: 无法获取交易品种 {position.symbol} 的信息")
-                        # 使用默认值继续
-                    
-                    # 构建平仓请求
-                    request = {
-                        "action": mt5.TRADE_ACTION_DEAL,
-                        "symbol": position.symbol,
-                        "volume": position.volume,
-                        "type": mt5.ORDER_TYPE_SELL if position.type == mt5.POSITION_TYPE_BUY else mt5.ORDER_TYPE_BUY,
-                        "position": follower_position_id,
-                        "price": mt5_conn.symbol_info_tick(position.symbol).bid if position.type == mt5.POSITION_TYPE_BUY else mt5_conn.symbol_info_tick(position.symbol).ask,
-                        "deviation": 300000,  # 使用大偏差值确保执行
-                        "magic": self.config_manager.EA_MAGIC,
-                        "type_time": mt5.ORDER_TIME_GTC,
-                        "type_filling": ORDER_FILLING_TYPE,
-                    }
-                    
-                    trade_requests[follower_name] = request
-                    logger.debug(f"为 {follower_name} 构建平仓请求: {request}")
-                    
-                except Exception as e:
-                    logger.error(f"跟单账户 {follower_name}: 构建平仓请求时出错: {e}")
-                finally:
-                    # 释放连接
-                    self.account_manager._release_connection(mt5_conn)
-            
-            if not trade_requests:
-                logger.info("未生成平仓交易请求。")
-                return
-
-            # 执行平仓
-            results = self.account_manager.execute_trades_parallel(trade_requests)
-
-            # 处理结果并从映射中移除已平仓位
-            success_count = 0
-            for name, result in results.items():
-                if result and result.get("status") == "success":
-                    logger.info(f"为 {name} 成功平仓跟单仓位 {follower_positions.get(name)}。")
-                    success_count += 1
-                else:
-                    error_msg = result.get("message", "未知错误") if result else "交易结果为空"
-                    logger.error(f"为 {name} 平仓失败: {error_msg}")
-            
-            # 保存状态
-            self._save_state_to_disk()
-            logger.info(f"已为主仓位 {master_position_id} 成功平仓 {success_count}/{len(follower_positions)} 个跟单仓位。")
-            
-            # 更新GUI持仓信息
-            self.update_positions()
-
-    def _build_trade_requests(self, event: DealAddEvent, is_open: bool, is_modify: bool = False, follower_positions: Optional[Dict[str, Any]] = None) -> Dict[str, Dict[str, Any]]:
-        # 构建要发送给 AccountManager 的交易请求。
-        # Args:
-        #     event: 触发交易的 DealAddEvent 或 PositionModifyEvent。
-        #     is_open: 如果是开仓请求则为 True，否则为 False。
-        #     is_modify: 如果是修改现有仓位则为 True。
-        #     follower_positions: 如果是平仓或修改，则为主仓位对应的跟单仓位。
-        # Returns:
-        #     映射账户名称到其交易请求字典的字典。
+    # 构建开仓或平仓的市价单请求
+    def _build_trade_requests(self, event: DealAddEvent, is_open: bool, follower_positions: Optional[Dict[str, Any]] = None) -> Dict[str, Dict[str, Any]]:
         trade_requests = {}
+        enabled_followers = self.config_manager.get_enabled_follower_configs()
+        if not enabled_followers: 
+            logger.warning("没有启用的跟单账户，无法构建交易请求")
+            return {}
+        
+        logger.info(f"开始为 {len(enabled_followers)} 个已启用账户构建{'开仓' if is_open else '平仓'}请求...")
+        
         master_symbol = event.symbol
-
-        # 获取主账户的点值大小，用于反向策略的SL/TP计算
-        master_symbol_info = mt5.symbol_info(master_symbol)
-        if not master_symbol_info:
-            # 注意：此处的mt5连接是上一个操作留下的，可能不是主账户的。
-            # 这是一个理论上的风险，但在当前单线程处理事件模型下风险较低。
-            # 更安全的做法是为EA也建立一个专用的连接通道。
-            logger.warning(f"无法获取主账户交易品种 {master_symbol} 的信息，反向策略的SL/TP计算可能不准。")
-            master_point = 0.00001 # 假设一个默认值
+        
+        master_info = None
+        for follower_name in enabled_followers:
+            if follower_name in self.account_manager.task_queues:
+                temp_info = self.account_manager.get_symbol_info(follower_name, master_symbol)
+                if temp_info:
+                    master_info = temp_info
+                    logger.debug(f"从账户 {follower_name} 获取到主品种 {master_symbol} 的信息")
+                    break
+        
+        if not master_info:
+            logger.warning(f"无法从任何跟单账户获取主品种 {master_symbol} 的信息，使用默认点值")
+            master_point = 0.00001
         else:
-            master_point = master_symbol_info.point
+            master_point = master_info.get('point', 0.00001)
 
-        for follower_name, follower_config in self.config_manager.get_enabled_follower_configs().items():
+        required_symbols = {
+            name: config.get("symbol_mapping", {}).get(master_symbol, master_symbol)
+            for name, config in enabled_followers.items()
+            if name in self.account_manager.task_queues
+        }
             
-            # 1. 确定跟单账户的交易品种
-            # 首先检查是否有特定的品种映射
-            follower_symbol = follower_config.get("symbol_mapping", {}).get(master_symbol, master_symbol)
+        if not required_symbols:
+            logger.error("没有可用的跟单账户工作进程来获取品种信息")
+            return {}
             
-            # 2. 获取跟单账户的品种信息
-            # 使用健壮的方法获取品种信息
-            symbol_info = self._get_symbol_info(follower_name, follower_symbol)
-            if not symbol_info:
-                logger.error(f"跟单账户 {follower_name}: 无法获取或创建品种 {follower_symbol} 的信息，跳过此账户的交易")
-                continue # 跳过此跟单账户
+        all_symbol_infos = self._get_symbol_info_from_workers(required_symbols)
+        
+        all_follower_pos_info = {}
+        if not is_open and follower_positions:
+            all_follower_pos_info = self._get_positions_from_workers(follower_positions)
 
-            # 3. 计算交易手数
-            lot_mode = follower_config.get("lot_mode", "multiplier")
-            if lot_mode == "risk_percentage":
-                # 基于风险百分比计算手数
-                lot_size = self._calculate_risk_based_lot_size(
-                    follower_name, event, follower_config, symbol_info, master_point
-                )
-                if lot_size is None:
-                    continue
-            elif lot_mode == "multiplier":
-                # 基于倍数的手数计算
-                multiplier = follower_config.get("lot_value", 1.0)
-                lot_size = event.volume * multiplier
-                logger.info(f"跟单账户 {follower_name}: 使用倍数 {multiplier} 计算手数，结果为 {lot_size}。")
-            else: # 固定手数
-                lot_size = follower_config.get("lot_value", 0.01)
-                logger.info(f"跟单账户 {follower_name}: 使用固定手数 {lot_size}。")
-
-            # 确保手数在有效范围内
-            lot_size = max(symbol_info.volume_min, min(lot_size, symbol_info.volume_max))
-            # 调整手数以符合步进大小
-            lot_size = round(lot_size / symbol_info.volume_step) * symbol_info.volume_step
+        for name, config in enabled_followers.items():
+            if name not in self.account_manager.task_queues:
+                continue
+                
+            symbol_info_ns = all_symbol_infos.get(name)
+            if not symbol_info_ns: 
+                logger.error(f"账户 '{name}' 无法获取品种 '{required_symbols.get(name)}' 的信息，跳过交易请求构建。")
+                continue
+                
+            symbol_info = symbol_info_ns.__dict__
             
-            if lot_size <= 0:
-                logger.warning(f"跟单账户 {follower_name}: 计算出的手数为 {lot_size}，无效。跳过此交易。")
+            if symbol_info.get('point', 0.0) == 0.0:
+                logger.error(f"账户 '{name}' 的品种 '{symbol_info['name']}' 点值为0，无法计算滑点，跳过。")
                 continue
 
-            trade_type = event.type
-            price = event.price
-            sl = event.sl
-            tp = event.tp
-            comment = "跟单"  
-
-            # 应用反向交易策略
-            if follower_config.get("reverse_trades", False):
-                trade_type = self.reverse_order_type_map.get(trade_type, trade_type)
-                logger.info(f"跟单账户 {follower_name}: 应用反向交易策略。新类型: {trade_type}")
-                
-                # 反转 SL/TP (如果适用且有意义)
-                if (sl > 0 or tp > 0) and follower_config.get("copy_reversed_sl_tp", True):
-                    # 根据反向交易策略计算新的SL/TP
-                    reversed_order_type = self.order_type_to_mt5.get(trade_type, mt5.ORDER_TYPE_BUY)
-                    sl, tp = self._calculate_reversed_sl_tp(
-                        reversed_order_type,
-                        price,
-                        sl,
-                        tp,
-                        symbol_info.point / master_point if master_point > 0 else 1.0
-                    )
-                    logger.info(f"跟单账户 {follower_name}: 已反转SL/TP值。新值: SL={sl}, TP={tp}")
-                else:
-                    # 如果不需要复制SL/TP或没有设置
-                    sl = 0
-                    tp = 0
-
-            request = {
-                "action": mt5.TRADE_ACTION_DEAL,
-                "symbol": symbol_info.name,
-                "volume": lot_size,
-                "type": self.order_type_to_mt5.get(trade_type, mt5.ORDER_TYPE_BUY), # 默认 BUY
-                "price": price,
-                "deviation": int(follower_config.get("max_slippage_pips", 3) / symbol_info.point), # 将点差转换为 MT5 偏差
-                "sl": sl,
-                "tp": tp,
-                "comment": comment,
-                "type_time": mt5.ORDER_TIME_GTC, # Good Till Cancel
-                "type_filling": ORDER_FILLING_TYPE,
-                "magic": self.config_manager.EA_MAGIC,
+            request_base = {
+                "magic": self.config_manager.get_setting("magic_number", 12345), 
+                "account_name": name,
+                "master_position_id": event.position_id
             }
-
+            
             if is_open:
-                logger.debug(f"为 {follower_name} 构建开仓请求: {request}")
-                trade_requests[follower_name] = request
-            elif is_modify:
-                # 对于修改，我们需要知道跟单仓位 ID
-                follower_position_id = follower_positions.get(follower_name)
-                if follower_position_id:
-                    request["action"] = mt5.TRADE_ACTION_SLTP # 专门用于修改 SL/TP
-                    request["position"] = follower_position_id
-                    # 修改请求不需要 volume, type, price, deviation, type_time, type_filling
-                    del request["volume"]
-                    del request["type"]
-                    del request["price"]
-                    del request["deviation"]
-                    del request["type_time"]
-                    del request["type_filling"]
-                    logger.debug(f"为 {follower_name} 构建修改头寸请求: {request}")
-                    trade_requests[follower_name] = request
-                else:
-                    logger.warning(f"跟单账户 {follower_name}: 未找到要修改的跟单仓位。跳过。")
-            else: # 平仓
-                follower_position_id = follower_positions.get(follower_name)
-                if follower_position_id:
-                    # 获取跟单仓位信息以确定平仓方向
-                    follower_pos_info = mt5.positions_get(ticket=follower_position_id)
-                    if follower_pos_info:
-                        follower_pos = follower_pos_info[0] # positions_get 返回元组
-                        # 平仓操作使用相反的类型
-                        close_type = mt5.ORDER_TYPE_SELL if follower_pos.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
-                        request = {
-                            "action": mt5.TRADE_ACTION_DEAL,
-                            "symbol": symbol_info.name,
-                            "volume": follower_pos.volume,
-                            "type": close_type,
-                            "position": follower_position_id,
-                            "price": price,
-                            "deviation": int(follower_config.get("max_slippage_pips", 3) / symbol_info.point),
-                            "magic": self.config_manager.EA_MAGIC,
-                            "type_time": mt5.ORDER_TIME_GTC,
-                            "type_filling": ORDER_FILLING_TYPE,
-                        }
-                        logger.debug(f"为 {follower_name} 构建平仓请求: {request}")
-                        trade_requests[follower_name] = request
-                    else:
-                        logger.warning(f"跟单账户 {follower_name}: 无法获取跟单仓位 {follower_position_id} 的信息。跳过平仓。")
-                else:
-                    logger.warning(f"跟单账户 {follower_name}: 未找到要平仓的跟单仓位。跳过。")
-
-        return trade_requests
-
-    def _build_pending_order_requests(self, event: OrderEvent, action: str, follower_orders: Optional[Dict[str, Any]] = None) -> Dict[str, Dict[str, Any]]:
-        # 根据订单事件构建挂单请求。
-        # Args:
-        #     event: 触发请求的 OrderEvent。
-        #     action: "ADD", "MODIFY", "DELETE"。
-        #     follower_orders: 现有跟单挂单的映射（仅用于 MODIFY/DELETE）。
-        # Returns:
-        #     映射账户名称到其交易请求字典的字典。
-        order_requests = {}
-        master_symbol = event.symbol
-
-        # 获取主账户的点值大小，用于反向策略的SL/TP计算
-        master_symbol_info = mt5.symbol_info(master_symbol)
-        if not master_symbol_info:
-            # 注意：此处的mt5连接是上一个操作留下的，可能不是主账户的。
-            # 这是一个理论上的风险，但在当前单线程处理事件模型下风险较低。
-            # 更安全的做法是为EA也建立一个专用的连接通道。
-            logger.warning(f"无法获取主账户交易品种 {master_symbol} 的信息，反向策略的SL/TP计算可能不准。")
-            master_point = 0.00001 # 假设一个默认值
-        else:
-            master_point = master_symbol_info.point
-
-        for follower_name, follower_config in self.config_manager.get_enabled_follower_configs().items():
-            try:
-                # 确定跟单账户的交易品种
-                # 首先检查是否有特定的品种映射
-                symbol = follower_config.get("symbol_mapping", {}).get(master_symbol, master_symbol)
-                
-                # 获取跟单账户的品种信息
-                # 使用健壮的方法获取品种信息
-                follower_symbol_info = self._get_symbol_info(follower_name, symbol)
-                if follower_symbol_info is None:
-                    logger.error(f"跟单账户 {follower_name}: 无法获取或创建品种 {symbol} 的信息，跳过此账户的交易")
-                    continue
-                follower_point = follower_symbol_info.point
-
-                # 跟单手数计算与开仓逻辑类似，但需针对挂单场景调整
-                lot_mode = follower_config.get("lot_mode", "fixed")
-                if lot_mode == "risk_percentage":
-                    # 挂单的风险计算更复杂，因为它依赖于未来的开仓价格。
-                    # 暂时，我们假设在挂单时不计算风险，直接使用固定手数，或者在市价单时应用风险。
-                    lot_size = follower_config.get("lot_value", 0.01)
-                    logger.warning(f"跟单账户 {follower_name}: 挂单不支持风险百分比模式，使用固定手数 {lot_size}。")
-                elif lot_mode == "multiplier":
-                    # 基于倍数的手数计算
-                    multiplier = follower_config.get("lot_value", 1.0)
-                    lot_size = event.volume * multiplier
-                    logger.info(f"跟单账户 {follower_name}: 使用倍数 {multiplier} 计算手数，结果为 {lot_size}。")
-                else: # 固定手数
-                    lot_size = follower_config.get("lot_value", 0.01)
-
-                # 确保手数在有效范围内
-                lot_size = max(follower_symbol_info.volume_min, min(lot_size, follower_symbol_info.volume_max))
-                lot_size = round(lot_size / follower_symbol_info.volume_step) * follower_symbol_info.volume_step
-
+                lot_size = self._calculate_lot_size(name, config, event, symbol_info, master_point)
                 if lot_size <= 0:
-                    logger.warning(f"跟单账户 {follower_name}: 计算出的手数为 {lot_size}，无效。跳过此订单。")
+                    logger.warning(f"跟单账户 {name}: 计算出的手数为 {lot_size}，无效。跳过此交易。")
                     continue
-
-                order_type = event.type
-                price_open = event.price_open
-                sl = event.sl
-                tp = event.tp
-                comment = "跟单"  
-
-                # 应用反向交易策略 (针对挂单类型)
-                if follower_config.get("reverse_trades", False):
-                    order_type = self.reverse_order_type_map.get(order_type, order_type)
-                    logger.info(f"跟单账户 {follower_name}: 应用反向交易策略。新类型: {order_type}")
                     
-                    # 反转 SL/TP (如果适用)
-                    if (sl > 0 or tp > 0) and follower_config.get("copy_reversed_sl_tp", True):
-                        # 根据反向交易策略计算新的SL/TP
-                        reversed_order_type = self.order_type_to_mt5.get(order_type, mt5.ORDER_TYPE_BUY_LIMIT)
-                        sl, tp = self._calculate_reversed_sl_tp(
-                            reversed_order_type,
-                            price_open,
-                            sl,
-                            tp,
-                            follower_point / master_point if master_point > 0 else 1.0
-                        )
-                        logger.info(f"跟单账户 {follower_name}: 已反转挂单SL/TP值。新值: SL={sl}, TP={tp}")
-                    else:
-                        # 如果不需要复制SL/TP或没有设置
-                        sl = 0
-                        tp = 0
+                trade_type, sl, tp = self._get_trade_params(config, event, symbol_info, master_point)
+                deviation = int(config.get("max_slippage_pips", 3) / symbol_info['point'])
 
                 request = {
-                    "action": mt5.TRADE_ACTION_PENDING,
-                    "symbol": symbol,
-                    "volume": lot_size,
-                    "type": self.order_type_to_mt5.get(order_type, mt5.ORDER_TYPE_BUY_LIMIT), # 默认 BUY_LIMIT
-                    "price": price_open,
-                    "deviation": int(follower_config.get("max_slippage_pips", 3) / follower_point),
-                    "sl": sl,
-                    "tp": tp,
-                    "comment": comment,
-                    "type_time": mt5.ORDER_TIME_GTC, 
-                    "type_filling": ORDER_FILLING_TYPE, 
-                    "magic": self.config_manager.EA_MAGIC,
+                    **request_base, "action": TradeAction.DEAL.value, "symbol": symbol_info['name'],
+                    "volume": lot_size, "type": self.order_type_to_mt5[trade_type].value,
+                    "price": event.price, "deviation": deviation,
+                    "sl": sl, "tp": tp, "comment": "跟单",
+                    "type_time": OrderTimeType.GTC.value, "type_filling": OrderFillingType.IOC.value,
                 }
+                trade_requests[name] = request
+                logger.info(f"为账户 '{name}' 构建开仓请求: 品种={symbol_info['name']}, 类型={trade_type}, 手数={lot_size}, 滑点={deviation}点")
+            else: #平仓
+                follower_ticket = follower_positions.get(name)
+                if not follower_ticket: 
+                    continue
+
+                pos_list = all_follower_pos_info.get(name, {}).get(follower_ticket)
+                if not pos_list: 
+                    logger.warning(f"账户 '{name}' 无法获取持仓 {follower_ticket} 的信息，跳过平仓请求构建")
+                    continue
+
+                follower_pos = pos_list
+                close_type = OrderType.SELL if follower_pos['type'] == OrderType.BUY.value else OrderType.BUY
+                deviation = int(config.get("max_slippage_pips", 3) / symbol_info['point'])
                 
-                if action == "ADD":
-                    logger.debug(f"为 {follower_name} 构建新挂单请求: {request}")
-                    order_requests[follower_name] = request
-                elif action == "MODIFY":
-                    follower_order_ticket = follower_orders.get(follower_name)
-                    if follower_order_ticket:
-                        request["action"] = mt5.TRADE_ACTION_MODIFY 
-                        request["order"] = follower_order_ticket
-                        del request["volume"]
-                        del request["type"]
-                        del request["deviation"]
-                        del request["type_time"]
-                        del request["type_filling"]
-                        logger.debug(f"为 {follower_name} 构建修改挂单请求: {request}")
-                        order_requests[follower_name] = request
-                    else:
-                        logger.warning(f"跟单账户 {follower_name}: 未找到要修改的跟单挂单。跳过。")
-                elif action == "DELETE":
-                    follower_order_ticket = follower_orders.get(follower_name)
-                    if follower_order_ticket:
-                        request = {
-                            "action": mt5.TRADE_ACTION_REMOVE,
-                            "order": follower_order_ticket,
-                            "magic": self.config_manager.EA_MAGIC,
-                        }
-                        logger.debug(f"为 {follower_name} 构建删除挂单请求: {request}")
-                        order_requests[follower_name] = request
-                    else:
-                        logger.warning(f"跟单账户 {follower_name}: 未找到要删除的跟单挂单。跳过。")
-            except Exception as e:
-                logger.error(f"为跟单账户 {follower_name} 构建挂单请求失败: {e}", exc_info=True)
+                request = {
+                    **request_base, "action": TradeAction.DEAL.value, "symbol": follower_pos['symbol'],
+                    "volume": follower_pos['volume'], "type": close_type.value,
+                    "position": follower_pos['ticket'], "price": event.price,
+                    "deviation": deviation,
+                    "type_time": OrderTimeType.GTC.value, "type_filling": OrderFillingType.IOC.value,
+                }
+                trade_requests[name] = request
+                logger.info(f"为账户 '{name}' 构建平仓请求: 持仓ID={follower_pos['ticket']}, 品种={follower_pos['symbol']}, 手数={follower_pos['volume']}")
+        
+        logger.info(f"构建了 {len(trade_requests)} 个交易请求")
+        return trade_requests
+
+    # 构建修改现有持仓止损/止盈的请求
+    def _build_modify_requests(self, event: PositionModifyEvent, follower_positions: Dict[str, int]) -> List[Dict]:
+        requests = []
+        enabled_followers = self.config_manager.get_enabled_follower_configs()
+        if not enabled_followers: return []
+        
+        first_follower_with_worker = next((name for name in enabled_followers if name in self.account_manager.task_queues), None)
+        if not first_follower_with_worker: 
+            logger.warning("没有带工作进程的跟单账户，无法获取主账户品种信息")
+            return []
+
+        master_info_ns = self.account_manager.get_symbol_info(first_follower_with_worker, event.symbol)
+        if not master_info_ns: return []
+        master_point = master_info_ns.get('point', 0.00001)
+        
+        flat_follower_positions = {name: ticket for name, ticket in follower_positions.items()}
+        follower_pos_infos_map = self._get_positions_from_workers(flat_follower_positions)
+
+        required_symbols = {
+            name: pos['symbol'] 
+            for name, pos_map in follower_pos_infos_map.items() 
+            for ticket, pos in pos_map.items()
+        }
+
+        follower_symbol_infos_ns = self._get_symbol_info_from_workers(required_symbols)
+
+        for name, pos_id in follower_positions.items():
+            config = enabled_followers.get(name)
+            if not config or not config.get("copy_sl_tp", True): continue
+            
+            f_pos = follower_pos_infos_map.get(name, {}).get(pos_id)
+            if not f_pos: continue
+            
+            f_sym_info_ns = follower_symbol_infos_ns.get(name)
+            if not f_sym_info_ns: continue
+
+            new_sl, new_tp = self._calculate_sl_tp_for_follower(config, event, f_pos, master_point, f_sym_info_ns.point)
+            
+            logger.info(f"为账户 {name} 构建修改请求: 仓位 {pos_id}, 新SL={new_sl}, 新TP={new_tp}")
+            
+            requests.append({
+                "action": TradeAction.SLTP.value, "position": pos_id,
+                "sl": new_sl, "tp": new_tp,
+                "magic": self.config_manager.get_setting("magic_number", 12345),
+                "account_name": name
+            })
+        return requests
+
+    # 构建添加、修改或删除挂单的请求
+    def _build_pending_order_requests(self, event: OrderEvent, action: str, follower_orders: Optional[Dict[str, Any]] = None) -> Dict[str, Dict[str, Any]]:
+        requests = {}
+        enabled_followers = self.config_manager.get_enabled_follower_configs()
+        if not enabled_followers: return {}
+        
+        logger.info(f"开始构建挂单请求, action: {action}, 主订单: {event.ticket}")
+
+        master_symbol = event.symbol
+        first_follower_with_worker = next((name for name in enabled_followers if name in self.account_manager.task_queues), None)
+        if not first_follower_with_worker:
+            logger.warning("没有可用的跟单账户来获取主品种信息")
+            return {}
+            
+        master_info = self.account_manager.get_symbol_info(first_follower_with_worker, master_symbol)
+        master_point = master_info.get('point', 0.00001) if master_info else 0.00001
+
+        required_symbols = {
+            n: c.get("symbol_mapping", {}).get(master_symbol, master_symbol) 
+            for n, c in enabled_followers.items() 
+            if n in self.account_manager.task_queues
+        }
+        all_symbol_infos_ns = self._get_symbol_info_from_workers(required_symbols)
+
+        for name, config in enabled_followers.items():
+            if name not in self.account_manager.task_queues: continue
+            
+            request_base = {"magic": self.config_manager.get_setting("magic_number", 12345), "account_name": name}
+            f_ord_id = follower_orders.get(name) if follower_orders else None
+            
+            if action == "DELETE":
+                if f_ord_id: 
+                    requests[name] = {**request_base, "action": TradeAction.REMOVE.value, "order": f_ord_id}
+                    logger.info(f"为账户 {name} 构建删除挂单请求: 订单号={f_ord_id}")
                 continue
 
-        return order_requests 
+            symbol_info_ns = all_symbol_infos_ns.get(name)
+            if not symbol_info_ns: 
+                logger.error(f"账户 {name} 无法获取品种信息，跳过挂单请求")
+                continue
 
-    def _calculate_reversed_sl_tp(self, position_type, open_price, master_sl, master_tp, point_ratio=1.0):
-        """
-        为反向交易计算镜像的止损止盈位置
+            symbol_info = symbol_info_ns.__dict__
+            if symbol_info.get('point', 0.0) == 0.0:
+                logger.error(f"账户 '{name}' 的品种 '{symbol_info['name']}' 点值为0，跳过")
+                continue
+
+            lot_size = self._calculate_lot_size(name, config, event, symbol_info, master_point)
+            if lot_size <= 0:
+                logger.warning(f"跟单账户 {name}: 挂单计算手数为 {lot_size}，无效，跳过")
+                continue
+
+            trade_type, sl, tp = self._get_trade_params(config, event, symbol_info, master_point)
+            deviation = int(config.get("max_slippage_pips", 3) / symbol_info['point'])
+
+            request = {
+                **request_base, "symbol": symbol_info['name'], "volume": lot_size,
+                "type": self.order_type_to_mt5[trade_type].value, "price": event.price_open,
+                "deviation": deviation,
+                "sl": sl, "tp": tp, "comment": "跟单",
+                "type_time": OrderTimeType.GTC.value, "type_filling": OrderFillingType.IOC.value,
+            }
+
+            if action == "ADD":
+                request["action"] = TradeAction.PENDING.value
+                requests[name] = request
+                logger.info(f"为账户 {name} 构建新挂单请求: 类型={trade_type}, 手数={lot_size}")
+            elif action == "MODIFY" and f_ord_id:
+                request["action"] = TradeAction.MODIFY.value
+                request["order"] = f_ord_id
+                requests[name] = request
+                logger.info(f"为账户 {name} 构建修改挂单请求: 订单号={f_ord_id}")
         
-        Args:
-            position_type: 跟单持仓类型 (mt5.ORDER_TYPE_BUY 或 mt5.ORDER_TYPE_SELL)
-            open_price: 跟单持仓的开仓价格
-            master_sl: 主账户的止损价格
-            master_tp: 主账户的止盈价格
-            point_ratio: 点值比率 (follower_point / master_point)
+        logger.info(f"构建了 {len(requests)} 个挂单请求")
+        return requests
+
+    # 并行从工作进程获取品种信息
+    def _get_symbol_info_from_workers(self, required_symbols: Dict[str, str]) -> Dict[str, SimpleNamespace]:
+        infos = {}
         
-        Returns:
-            (new_sl, new_tp): 计算后的止损和止盈价格
-        """
-        # 如果原始SL/TP都为0，不设置新的SL/TP
-        if master_sl <= 0 and master_tp <= 0:
-            return 0, 0
+        # 过滤掉没有工作进程的账户
+        valid_symbols = {}
+        for name, symbol in required_symbols.items():
+            if name in self.account_manager.task_queues:
+                valid_symbols[name] = symbol
+                logger.info(f"准备获取账户 '{name}' 的品种 '{symbol}' 信息")
+            else:
+                logger.warning(f"账户 '{name}' 没有工作进程，跳过品种信息获取")
+                infos[name] = None
         
-        new_sl = 0
-        new_tp = 0
-        
-        # 反转SL/TP逻辑：止损变止盈，止盈变止损
-        # 买入变为卖出：开仓价格上方的止盈变为下方的止损，下方的止损变为上方的止盈
-        # 卖出变为买入：开仓价格下方的止盈变为上方的止损，上方的止损变为下方的止盈
-        if position_type == mt5.ORDER_TYPE_BUY:
-            # 跟单是买入 (主账户应该是卖出)
-            if master_tp > 0:  # 主账户的TP (下方) 变为跟单账户的SL (下方)
-                # 计算点数距离并应用点值比率
-                distance_points = (open_price - master_tp) * point_ratio
-                new_sl = open_price - distance_points
+        if not valid_symbols:
+            logger.error("没有有效的账户可以获取品种信息")
+            return infos
             
-            if master_sl > 0:  # 主账户的SL (上方) 变为跟单账户的TP (上方)
-                distance_points = (master_sl - open_price) * point_ratio
-                new_tp = open_price + distance_points
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(valid_symbols)) as executor:
+            future_to_follower = {
+                executor.submit(self.account_manager.get_symbol_info, name, symbol): (name, symbol) 
+                for name, symbol in valid_symbols.items()
+            }
+            
+            for future in concurrent.futures.as_completed(future_to_follower):
+                follower_name, symbol = future_to_follower[future]
+                try:
+                    info_dict = future.result()
+                    if info_dict:
+                        infos[follower_name] = SimpleNamespace(**info_dict)
+                        logger.info(f"成功获取账户 '{follower_name}' 的品种 '{symbol}' 信息")
+                    else:
+                        infos[follower_name] = None
+                        logger.error(f"账户 '{follower_name}' 返回空的品种信息，请检查品种 '{symbol}' 是否存在")
+                except Exception as exc:
+                    logger.error(f"为账户 '{follower_name}' 获取品种 '{symbol}' 信息时出错: {exc}", exc_info=True)
+                    infos[follower_name] = None
+                    
+        return infos
+
+    # 并行从工作进程获取持仓信息
+    def _get_positions_from_workers(self, required_positions: Dict[str, int]) -> Dict[str, Dict[int, Dict]]:
+        positions = {}
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            future_to_follower = { executor.submit(self.account_manager.get_positions, name, ticket): (name, ticket) for name, ticket in required_positions.items() }
+            for future in concurrent.futures.as_completed(future_to_follower):
+                follower_name, ticket = future_to_follower[future]
+                try:
+                    result = future.result()
+                    if result and result.get('status') == 'success' and result.get('positions'):
+                        if follower_name not in positions:
+                            positions[follower_name] = {}
+                        positions[follower_name][ticket] = result['positions'][0]
+
+                except Exception as exc:
+                    logger.error(f"为账户 {follower_name} 获取持仓信息时出错: {exc}", exc_info=True)
+        return positions
+
+    # 为跟单账户计算合适的交易手数
+    def _calculate_lot_size(self, follower_name, follower_config, event, symbol_info, master_point):
+        lot_mode = follower_config.get("lot_mode", "multiplier")
+        lot_size = 0.0
+        
+        # 获取主账户交易量
+        master_volume = event.volume if isinstance(event, DealAddEvent) else event.volume_initial
+        
+        if lot_mode == "risk_percentage":
+            if isinstance(event, DealAddEvent):
+                 lot_size = self._calculate_risk_based_lot_size(follower_name, event, follower_config, symbol_info, master_point)
+            else:
+                logger.warning(f"跟单账户 {follower_name}: 挂单不支持风险百分比模式，使用固定手数。")
+                lot_size = follower_config.get("lot_value", 0.01)
+        elif lot_mode == "multiplier":
+            multiplier = follower_config.get("lot_value", 1.0)
+            lot_size = master_volume * multiplier
+            logger.info(f"跟单账户 {follower_name}: 使用倍数 {multiplier} on master volume {master_volume} -> lots: {lot_size}")
+        else: # fixed lot
+            lot_size = follower_config.get("lot_value", 0.01)
+            logger.info(f"跟单账户 {follower_name}: 使用固定手数: {lot_size}")
+        
+        if lot_size is None or lot_size <= 0: 
+            return 0.0
+            
+        # 确保手数在有效范围内
+        lot_size = max(symbol_info['volume_min'], min(lot_size, symbol_info['volume_max']))
+        
+        # 修正手数以符合步进大小
+        volume_step = symbol_info.get('volume_step', 0.01)
+        if volume_step > 0:
+            lot_size = round(lot_size / volume_step) * volume_step
+            # 由于浮点数精度问题，再次进行格式化
+            lot_size = float(f"{lot_size:.{len(str(volume_step).split('.')[-1])}f}")
+
+        return lot_size
+
+    # 根据跟单策略决定交易参数
+    def _get_trade_params(self, follower_config, event, symbol_info, master_point):
+        trade_type_str = event.type
+        sl, tp = event.sl, event.tp
+        if follower_config.get("strategy") == "reverse":
+            trade_type_str = self.reverse_order_type_map.get(trade_type_str, trade_type_str)
+            if sl > 0 or tp > 0:
+                price = event.price if isinstance(event, DealAddEvent) else event.price_open
+                order_type_val = self.order_type_to_mt5[trade_type_str].value
+                sl, tp = self._calculate_reversed_sl_tp(order_type_val, price, sl, tp, symbol_info['point'] / master_point if master_point > 0 else 1.0)
+            else:
+                sl, tp = 0.0, 0.0
+        return trade_type_str, sl, tp
+
+    # 为跟单仓位计算止损/止盈
+    def _calculate_sl_tp_for_follower(self, follower_config, event, follower_position, master_point, follower_point):
+        point_ratio = follower_point / master_point if master_point > 0 else 1.0
+        if follower_config.get("strategy") == "reverse":
+            return self._calculate_reversed_sl_tp(follower_position['type'], follower_position['price_open'], event.sl, event.tp, point_ratio)
         else:
-            # 跟单是卖出 (主账户应该是买入)
-            if master_tp > 0:  # 主账户的TP (上方) 变为跟单账户的SL (上方)
-                distance_points = (master_tp - open_price) * point_ratio
-                new_sl = open_price + distance_points
-            
-            if master_sl > 0:  # 主账户的SL (下方) 变为跟单账户的TP (下方)
-                distance_points = (open_price - master_sl) * point_ratio
-                new_tp = open_price - distance_points
-        
-        return new_sl, new_tp 
+            new_sl, new_tp = 0.0, 0.0
+            if event.sl > 0:
+                master_sl_points = abs(event.price_open - event.sl) / master_point
+                new_sl = follower_position['price_open'] - (master_sl_points * follower_point) if follower_position['type'] == OrderType.BUY.value else follower_position['price_open'] + (master_sl_points * follower_point)
+            if event.tp > 0:
+                master_tp_points = abs(event.tp - event.price_open) / master_point
+                new_tp = follower_position['price_open'] + (master_tp_points * follower_point) if follower_position['type'] == OrderType.BUY.value else follower_position['price_open'] - (master_tp_points * follower_point)
+            return new_sl, new_tp
 
-    def register_position_update_callback(self, callback):
-        """注册持仓更新回调函数"""
-        self.position_update_callback = callback
+    # 为反向交易计算镜像的止损/止盈
+    def _calculate_reversed_sl_tp(self, order_type_val, open_price, master_sl, master_tp, point_ratio=1.0):
+        new_sl, new_tp = 0.0, 0.0
+        is_sell_type = order_type_val in [OrderType.SELL.value, OrderType.SELL_LIMIT.value, OrderType.SELL_STOP.value, OrderType.SELL_STOP_LIMIT.value]
+        if master_tp > 0:
+            master_sl_dist = abs(open_price - master_tp)
+            new_sl = open_price + master_sl_dist * point_ratio if is_sell_type else open_price - master_sl_dist * point_ratio
+        if master_sl > 0:
+            master_tp_dist = abs(open_price - master_sl)
+            new_tp = open_price - master_tp_dist * point_ratio if is_sell_type else open_price + master_tp_dist * point_ratio
+        return new_sl, new_tp
+
+    # 根据账户余额的风险百分比计算手数
+    def _calculate_risk_based_lot_size(self, follower_name, event, follower_config, symbol_info, master_point):
+        risk_percentage = follower_config.get("lot_value", 1.0)
+        account_info_payload = self.account_manager.get_account_info(follower_name)
+        if not account_info_payload or not account_info_payload.get("info"): return None
+        balance = account_info_payload["info"].get("balance")
+        if not balance: return None
         
-    def update_positions(self):
-        """更新并发送持仓信息到GUI"""
-        if not self.position_update_callback:
-            return
+        sl_price = event.sl
+        if sl_price == 0:
+            logger.warning(f"无法为账户 {follower_name} 计算基于风险的手数，因为主交易没有止损。")
+            return None
+
+        price = event.price if isinstance(event, DealAddEvent) else event.price_open
+        point_ratio = symbol_info['point'] / master_point if master_point > 0 else 1.0
+        sl_dist_points = abs(price - sl_price) / master_point
+        follower_sl_dist_currency = sl_dist_points * symbol_info['point'] * point_ratio
+        
+        if follower_sl_dist_currency == 0 or symbol_info['trade_tick_value'] == 0:
+            logger.warning(f"无法为账户 {follower_name} 计算基于风险的手数，止损距离或点值为零。")
+            return None
             
-        try:
-            positions_data = []
-            with self.lock:
-                for master_id, followers in self.position_map.items():
-                    # 获取主账户持仓信息
-                    master_pos = None
-                    try:
-                        # 尝试通过MT5 API获取主账户持仓详情
-                        master_pos_info = mt5.positions_get(ticket=int(master_id))
-                        if master_pos_info:
-                            master_pos = master_pos_info[0]
-                    except Exception as e:
-                        logger.warning(f"获取主账户持仓 {master_id} 信息失败: {e}")
-                    
-                    position_data = {
-                        "master_ticket": master_id,
-                        "master_symbol": "未知",
-                        "master_volume": 0.0,
-                        "master_profit": 0.0,
-                        "master_type": "未知",
-                        "follower_positions": {}
-                    }
-                    
-                    if master_pos:
-                        position_data.update({
-                            "master_symbol": master_pos.symbol,
-                            "master_volume": master_pos.volume,
-                            "master_profit": master_pos.profit,
-                            "master_type": "BUY" if master_pos.type == mt5.ORDER_TYPE_BUY else "SELL"
-                        })
-                    
-                    # 获取跟单账户持仓信息
-                    for follower_name, follower_id in followers.items():
-                        if not isinstance(follower_id, (int, float)):
-                            continue
-                            
-                        follower_data = {
-                            "ticket": follower_id,
-                            "volume": 0.0,
-                            "profit": 0.0,
-                            "type": "未知"
-                        }
-                        
-                        try:
-                            # 使用账户管理器安全地获取持仓信息
-                            mt5_conn = self.account_manager._get_connection(follower_name)
-                            if mt5_conn:
-                                try:
-                                    follower_pos_info = mt5_conn.positions_get(ticket=int(follower_id))
-                                    if follower_pos_info:
-                                        follower_pos = follower_pos_info[0]
-                                        follower_data.update({
-                                            "volume": follower_pos.volume,
-                                            "profit": follower_pos.profit,
-                                            "type": "BUY" if follower_pos.type == mt5.ORDER_TYPE_BUY else "SELL"
-                                        })
-                                finally:
-                                    # 释放连接
-                                    self.account_manager._release_connection(mt5_conn)
-                        except Exception as e:
-                            logger.warning(f"获取跟单账户 {follower_name} 持仓 {follower_id} 信息失败: {e}")
-                        
-                        position_data["follower_positions"][follower_name] = follower_data
-                    
-                    positions_data.append(position_data)
-            
-            # 调用回调函数发送持仓数据
-            if self.position_update_callback:
-                self.position_update_callback(positions_data)
-                
-        except Exception as e:
-            logger.error(f"更新持仓信息失败: {e}", exc_info=True) 
+        risk_amount = balance * (risk_percentage / 100.0)
+        lot_size = risk_amount / (follower_sl_dist_currency * symbol_info['trade_tick_value'])
+        return lot_size
+
+    def handle_trade_result(self, result: Dict[str, Any]):
+        """
+        Handles trade results coming from the asynchronous callback.
+        NOTE: This is currently a placeholder. The main trade logic is synchronous.
+        """
+        logger.info(f"Trade result received by callback (currently not processed in main logic): {result}")
+        # In a future refactor, the logic from _execute_and_process_trades
+        # should be moved here to make the trade flow fully asynchronous.
+        pass
+
+    def __del__(self):
+        # 对象销毁时安全地停止线程，但不记录日志
+        self._running_update_thread = False

@@ -1,287 +1,359 @@
 import zmq
 import threading
-from typing import Callable, Optional, Dict, Any
+from typing import Callable, Dict, Any
 import logging
 import time
 import json
-import os
 
-# Import connection settings - try to use the settings module or fall back to defaults
-try:
-    from config.settings import ZMQ_SYNC_URI, ZMQ_PUB_URI
-except ImportError:
-    # Default values if settings module is not available
-    ZMQ_SYNC_URI = "tcp://localhost:5555"
-    ZMQ_PUB_URI = "tcp://localhost:5556"
-from core.config_manager import ConfigManager
-from core.events import create_event_from_dict, HeartbeatEvent
-from core.error_handler import CircuitBreaker
+from .config_manager import ConfigManager
+from .error_handler import handle_exceptions, with_retry, ErrorCategory, HandledException
+from .events import create_event_from_dict, HeartbeatEvent
 
-# 设置日志
 logger = logging.getLogger("TradeCopier.ZmqListener")
 
 class ZmqListener:
-    # 负责监听来自 MT5 EA 的 ZeroMQ 消息（包括同步和交易事件）。在单独的线程中运行，以避免阻塞主应用程序。
-    def __init__(
-        self,
-        config_manager: ConfigManager,
-        event_callback: Callable[[Dict[str, Any]], None], # 接受解析后的事件字典
-        state_sync_callback: Callable[[Dict[str, Any]], None]
-    ):
-        # 初始化 ZmqListener。
-        # Args:
-        #     config_manager: ConfigManager 的实例。
-        #     event_callback: 用于处理接收到的交易事件的回调函数。
-        #     state_sync_callback: 用于处理 EA 状态同步的回调函数。
+    # 负责监听来自 MT5 EA 的 ZeroMQ 消息
+    def __init__(self, config_manager: ConfigManager, event_callback: Callable[[Dict[str, Any]], None], state_sync_callback: Callable[[Dict[str, Any]], None]):
         self.config_manager = config_manager
         self.event_callback = event_callback
         self.state_sync_callback = state_sync_callback
-        self.context = None
-        self.sync_socket = None
-        self.bus_socket = None
+        self.context: zmq.Context = None
+        self.sync_socket: zmq.Socket = None
+        self.bus_socket: zmq.Socket = None
+        self.poller: zmq.Poller = None
         self.running = False
         self.listener_thread = None
-
-        # ZMQ 设置
-        zmq_settings = self.config_manager.get_zmq_settings()
-        self.transport = zmq_settings.get("transport", "tcp")
-        self.tcp_host = zmq_settings.get("tcp_host", "localhost")
-        self.sync_port = zmq_settings.get("sync_port", 5555)
-        self.bus_port = zmq_settings.get("bus_port", 5556)
-
-        # 根据传输模式构建 URI
-        if self.transport == "ipc":
-            self.sync_uri = f"ipc://{zmq_settings.get('ipc_sync_path', 'mt5_sync.ipc')}"
-            self.bus_uri = f"ipc://{zmq_settings.get('ipc_bus_path', 'mt5_trade.ipc')}"
-        else: # 默认为 tcp
-            self.sync_uri = f"tcp://{self.tcp_host}:{self.sync_port}"
-            self.bus_uri = f"tcp://{self.tcp_host}:{self.bus_port}"
-
-        # 心跳配置
-        self.heartbeat_interval = 5  # 秒
-        
-        # 添加断路器以防止故障扩散
-        self.circuit_breaker = CircuitBreaker(failure_threshold=5, recovery_timeout=60.0)
         self.last_heartbeat_time = time.time()
+        self._setup_uris()
+        
+        # 心跳恢复机制
+        self.heartbeat_timeout = 60.0  # 60秒无心跳视为断开
+        self.heartbeat_warning_threshold = 30.0  # 30秒无心跳发出警告
+        self.last_warning_time = 0  # 上次警告时间，避免频繁日志
+        self.last_handshake_time = 0  # 上次握手成功时间
+        
+        # 重连机制
+        self.reconnect_delay = 5  # 重连延迟（秒）
+        self.max_reconnect_delay = 30  # 最大重连延迟
+        self.current_reconnect_delay = self.reconnect_delay  # 当前重连延迟
+        self.reconnect_attempts = 0  # 重连尝试次数
 
-        logger.debug("ZmqListener 已初始化。")
+    # 根据配置构建 ZMQ 连接地址
+    def _setup_uris(self):
+        settings = self.config_manager.get_zmq_settings()
+        transport = settings.get("transport", "tcp")
+        if transport == "ipc":
+            self.sync_uri = f"ipc://{settings.get('ipc_sync_path', 'mt5_sync.ipc')}"
+            self.bus_uri = f"ipc://{settings.get('ipc_bus_path', 'mt5_trade.ipc')}"
+        else:
+            host = settings.get("tcp_host", "localhost")
+            sync_port = settings.get("req_port", 5555)
+            bus_port = settings.get("sub_port", 5556)
+            self.sync_uri = f"tcp://{host}:{sync_port}"
+            self.bus_uri = f"tcp://{host}:{bus_port}"
 
+    # 启动监听器线程
     def start(self):
-        # 启动监听器的主控制循环。
         if self.running:
             logger.warning("ZMQ 监听器已在运行。")
             return
         self.running = True
-        self.listener_thread = threading.Thread(target=self._listen_loop, name="ZmqListenerThread")
-        self.listener_thread.daemon = True # 允许程序在线程仍在运行时退出
+        self.listener_thread = threading.Thread(target=self._control_loop, name="ZmqListenerThread", daemon=True)
         self.listener_thread.start()
-        logger.debug("ZmqListener 线程已启动。")
+        logger.info("ZMQ 监听器已启动。")
 
+    # 停止监听器线程
     def stop(self):
-        # 停止监听器线程并等待其终止。
-        if not self.running:
-            logger.warning("ZMQ 监听器未在运行。")
-            return
+        if not self.running: return
         logger.info("正在停止 ZMQ 监听器...")
         self.running = False
-        if self.listener_thread:
-            self.listener_thread.join(timeout=5) # 等待线程终止
-            if self.listener_thread.is_alive():
-                logger.warning("ZMQ 监听器线程未能及时终止。")
+        if self.listener_thread and self.listener_thread.is_alive():
+            self.listener_thread.join(timeout=2)
         self._close_sockets()
         logger.info("ZMQ 监听器已停止。")
 
-    def _close_sockets(self):
-        # 关闭所有 ZeroMQ 套接字并终止上下文。
-        if self.bus_socket:
-            self.bus_socket.close()
-            self.bus_socket = None
-            logger.debug("总线套接字已关闭。")
-        if self.sync_socket:
-            self.sync_socket.close()
-            self.sync_socket = None
-            logger.debug("同步套接字已关闭。")
-        if self.context:
-            self.context.term()
-            self.context = None
-            logger.debug("ZMQ 上下文已终止。")
-
-    def _listen_loop(self):
-        # 监听器线程的主控制循环。这个循环管理连接状态并在连接丢失时尝试重新连接。
-        logger.info("ZMQ 监听器控制线程已启动。")
-        # 初始化轮询器
-        self.poller = zmq.Poller()
+    # 管理连接和接收的控制循环
+    def _control_loop(self):
         while self.running:
             try:
-                if not self._ensure_connection():
-                    logger.warning("无法建立与 EA 的连接。在重试前等待。")
-                    time.sleep(self.config_manager.get_setting("reconnect_delay", 5)) # 可配置的重连延迟
+                # 初始化套接字
+                if not self._setup_sockets():
+                    # 套接字初始化失败，使用退避算法延迟重试
+                    self._handle_connection_failure()
                     continue
-
-                self._perform_stateful_handshake()
-                logger.info(f"连接已建立。正在监听来自 {self.bus_uri} 的事件...")
-                self._receive_events()
-
-            except zmq.Again as e:
-                # 非阻塞操作，没有收到消息
-                # logger.debug("ZMQ 非阻塞操作: 未收到消息。") # 过于频繁，改为警告
-                time.sleep(0.1) # 短暂睡眠以避免 CPU 占用过高
-            except zmq.ZMQError as e:
-                logger.error(f"ZMQ 错误: {e}", exc_info=True)
-                self._close_sockets() # 强制关闭套接字以进行干净的重新连接
-                time.sleep(self.config_manager.get_setting("reconnect_delay", 5))
+                
+                # 执行握手和状态同步
+                if not self._perform_handshake():
+                    # 握手失败，使用退避算法延迟重试
+                    self._handle_connection_failure()
+                    continue
+                    
+                # 握手成功，重置重连参数
+                self.reconnect_attempts = 0
+                self.current_reconnect_delay = self.reconnect_delay
+                
+                # 开始接收事件循环
+                self._receive_loop()
+            except HandledException as e:
+                if 'zmq.error.Again' in e.error_info.traceback_str:
+                    logger.critical(f"连接EA失败: ZMQ超时")
+                else:
+                    logger.error(f"ZMQ 控制循环中发生已知错误: {e}", exc_info=False)
+                self._handle_connection_failure()
             except Exception as e:
-                logger.error(f"监听循环中发生意外错误: {e}", exc_info=True)
-                self._close_sockets() # 确保在所有错误上关闭套接字
-                time.sleep(self.config_manager.get_setting("reconnect_delay", 5))
+                logger.error(f"ZMQ 控制循环中发生意外错误，将在{self.current_reconnect_delay}秒后重试连接: {e}", exc_info=True)
+                self._handle_connection_failure()
 
-    def _ensure_connection(self) -> bool:
-        # 确保 ZeroMQ 套接字已初始化并连接。
-        # Returns:
-        #     bool: 如果连接成功则为 True，否则为 False。
-        if self.context and self.sync_socket and self.bus_socket:
-            return True # 已经连接
+    # 处理连接失败的退避算法
+    def _handle_connection_failure(self):
+        self._close_sockets()
+        self.reconnect_attempts += 1
+        # 使用指数退避算法增加重试间隔，但不超过最大值
+        self.current_reconnect_delay = min(
+            self.reconnect_delay * (1.5 ** min(self.reconnect_attempts, 10)), 
+            self.max_reconnect_delay
+        )
+        logger.warning(f"连接EA失败，第{self.reconnect_attempts}次尝试，将在{self.current_reconnect_delay:.1f}秒后重试")
+        time.sleep(self.current_reconnect_delay)
 
-        self._close_sockets() # 确保从干净状态开始
-
+    # 初始化或重新初始化 ZMQ 套接字
+    def _setup_sockets(self):
         try:
+            self._close_sockets()
             self.context = zmq.Context()
+            self.poller = zmq.Poller()
             
             # 同步套接字 (REQ/REP)
             self.sync_socket = self.context.socket(zmq.REQ)
-            self.sync_socket.setsockopt(zmq.RCVTIMEO, 5000) # 5 秒接收超时
-            self.sync_socket.setsockopt(zmq.REQ_CORRELATE, 1)
-            self.sync_socket.setsockopt(zmq.REQ_RELAXED, 1)
-            logger.debug(f"连接到同步 URI: {self.sync_uri}")
+            self.sync_socket.setsockopt(zmq.RCVTIMEO, 5000) # 5秒超时
+            self.sync_socket.setsockopt(zmq.LINGER, 0)  # 不延迟关闭
             self.sync_socket.connect(self.sync_uri)
-            self.poller.register(self.sync_socket, zmq.POLLIN) # 注册同步套接字到轮询器
-
+            
             # 事件总线套接字 (SUB)
             self.bus_socket = self.context.socket(zmq.SUB)
-            self.bus_socket.setsockopt_string(zmq.SUBSCRIBE, "TRADE_EVENT") # 订阅所有交易事件
-            self.bus_socket.setsockopt_string(zmq.SUBSCRIBE, "HEARTBEAT") # 订阅心跳
-            self.bus_socket.setsockopt(zmq.RCVTIMEO, 1000) # 1 秒接收超时用于心跳检测
-            logger.debug(f"连接到总线 URI: {self.bus_uri}")
+            self.bus_socket.setsockopt_string(zmq.SUBSCRIBE, "")  # 订阅所有消息
+            self.bus_socket.setsockopt(zmq.RCVTIMEO, 1000)  # 1秒接收超时
+            self.bus_socket.setsockopt(zmq.LINGER, 0)  # 不延迟关闭
             self.bus_socket.connect(self.bus_uri)
-            self.poller.register(self.bus_socket, zmq.POLLIN) # 注册总线套接字到轮询器
             
-            logger.info("ZMQ 套接字已成功创建并连接。")
+            # 只将需要被轮询的 SUB 套接字注册到 poller
+            self.poller.register(self.bus_socket, zmq.POLLIN)
+            logger.info(f"ZMQ 套接字已初始化。Sync: {self.sync_uri}, Bus: {self.bus_uri}")
             return True
         except zmq.ZMQError as e:
-            logger.error(f"ZMQ 连接错误: {e}. URI: {self.sync_uri} 或 {self.bus_uri}")
-            self._close_sockets()
+            logger.error(f"设置ZMQ套接字失败: {e}")
             return False
         except Exception as e:
-            logger.error(f"创建 ZMQ 连接时发生意外错误: {e}", exc_info=True)
-            self._close_sockets()
+            logger.error(f"设置ZMQ套接字时发生未知错误: {e}", exc_info=True)
             return False
 
-    def _perform_stateful_handshake(self):
-        # 执行与 MQL5 EA 的状态感知同步，通过请求所有持仓和订单的当前状态。
-        # 这个函数假定 self.sync_socket 已经连接。
-        logger.info(f"正在与 EA 在 {self.sync_uri} 上执行状态握手...")
+    # 关闭并清理所有 ZMQ 资源
+    def _close_sockets(self):
+        # 按正确的顺序安全关闭，避免KeyError
+        if self.poller and self.bus_socket and not getattr(self.bus_socket, 'closed', True):
+            try:
+                self.poller.unregister(self.bus_socket)
+            except (KeyError, zmq.ZMQError):
+                pass  # 如果套接字已关闭或未注册，忽略错误
+        
+        for sock_attr in ['sync_socket', 'bus_socket']:
+            sock = getattr(self, sock_attr, None)
+            if sock and not getattr(sock, 'closed', True):
+                try:
+                    sock.close(linger=0)
+                except zmq.ZMQError:
+                    pass  # 忽略关闭错误
+        
+        if self.context and not getattr(self.context, 'closed', True):
+            try:
+                self.context.term()
+            except zmq.ZMQError:
+                pass  # 忽略关闭错误
+
+        self.sync_socket, self.bus_socket, self.context, self.poller = None, None, None, None
+
+    # 与 EA 执行握手和状态同步
+    def _perform_handshake(self):
         try:
-            # 记录上次握手时间，避免频繁握手
-            current_time = time.time()
-            if hasattr(self, '_last_handshake_time') and (current_time - self._last_handshake_time < 60):
-                logger.debug(f"距离上次握手仅过去了 {current_time - self._last_handshake_time:.1f} 秒，跳过握手。")
-                return
-                
-            self._last_handshake_time = current_time
+            logger.info("正在与 EA 执行握手...")
             
-            # 1. 发送 SYNC 请求
+            # 握手步骤 1: SYNC → ACK
             self.sync_socket.send_string("SYNC")
-            logger.debug("已发送 SYNC 请求。")
-
-            # 2. 接收 ACK 响应
             response = self.sync_socket.recv_string()
-            if response == "ACK":
-                logger.debug("接收到 ACK。同步成功。")
-            else:
-                logger.warning(f"同步失败：接收到意外响应 '{response}'。")
-                # 如果同步失败，尝试重新连接
-                self._close_sockets()
-                return
-            
-            # 3. 发送 GET_STATE 请求
+            if response != "ACK":
+                logger.warning(f"握手失败: 预期收到'ACK'，但收到'{response}'")
+                return False
+        
+            # 握手步骤 2: 状态同步
+            logger.info("正在请求 EA 的当前状态...")
             self.sync_socket.send_string("GET_STATE")
-            logger.debug("已发送 GET_STATE 请求。")
-
-            # 4. 接收状态 JSON
             state_json = self.sync_socket.recv_string()
-            logger.debug(f"接收到状态 JSON: {state_json[:200]}...") # 限制日志长度
             
-            # 解析并传递状态给回调
-            state_data = json.loads(state_json)
-            self.state_sync_callback(state_data)
-            logger.info("状态同步与 EA 成功。")
-
+            try:
+                state_data = json.loads(state_json)
+                self.state_sync_callback(state_data)
+                logger.info("与 EA 的状态同步成功。")
+                
+                # 更新心跳和握手时间
+                self.last_heartbeat_time = time.time()
+                self.last_handshake_time = time.time()
+                return True
+            except json.JSONDecodeError as e:
+                logger.error(f"无法解析EA状态JSON: {e}")
+                return False
+                
         except zmq.Again:
-            logger.warning("接收超时（EA 未响应握手）。连接可能已丢失。")
-            self._close_sockets() # 强制关闭以触发重连
-        except json.JSONDecodeError as e:
-            logger.error(f"解析 EA 状态 JSON 失败: {e}. JSON: {state_json}")
-            self._close_sockets()
+            logger.warning("握手超时: EA未在规定时间内响应")
+            return False
         except zmq.ZMQError as e:
-            logger.error(f"握手期间发生 ZMQ 错误: {e}")
-            self._close_sockets()
+            logger.error(f"握手期间发生ZMQ错误: {e}")
+            return False
         except Exception as e:
-            logger.error(f"握手期间发生意外错误: {e}", exc_info=True)
-            self._close_sockets()
+            logger.error(f"握手期间发生未知错误: {e}", exc_info=True)
+            return False
 
-    def _receive_events(self):
-        # 监听 SUB 套接字上的交易事件。如果EA在特定时间段内未收到消息，则此循环将退出，假设与EA的连接已丢失。
+    # 接收事件的主循环
+    @handle_exceptions(category=ErrorCategory.TRANSIENT, re_raise=True)
+    def _receive_loop(self):
+        # 增加心跳超时时间，从30秒改为60秒，提高容错性
+        heartbeat_timeout = self.heartbeat_timeout
+        # 添加上次警告时间记录，避免频繁日志
+        last_warning_time = self.last_warning_time
+        
         while self.running:
             try:
-                # 轮询总线套接字，检查是否有消息或心跳超时
-                if not self.bus_socket: # 如果套接字在其他地方被关闭
-                    break
-
-                # 使用 poll 检查消息，带有心跳超时
-                socks = dict(self.poller.poll(self.heartbeat_interval * 1000))
-
-                if self.bus_socket in socks and socks[self.bus_socket] == zmq.POLLIN:
-                    # 接收多部分消息：主题和数据
-                    topic = self.bus_socket.recv_string(zmq.DONTWAIT)
-                    payload = self.bus_socket.recv_string(zmq.DONTWAIT)
+                socks = dict(self.poller.poll(timeout=1000))
+                if self.bus_socket in socks:
+                    topic, payload = self.bus_socket.recv_multipart()
+                    topic_str = topic.decode('utf-8')
                     
-                    if topic == "HEARTBEAT":
-                        # 处理心跳
-                        self.last_heartbeat_time = time.time()
-                        logger.debug("收到心跳。")
-                        # 可以选择触发一个心跳事件到主引擎
-                        self.event_callback(HeartbeatEvent(timestamp=int(time.time() * 1000)).__dict__)
-                    elif topic == "TRADE_EVENT":
-                        # 处理交易事件
-                        try:
-                            event_dict = json.loads(payload)
-                            # logger.debug(f"接收到原始事件: {payload}") # 调试时启用
-                            self.event_callback(event_dict)
-                        except json.JSONDecodeError as e:
-                            logger.error(f"解码事件 JSON 失败: {e}. Payload: {payload}")
-                        except Exception as e:
-                            logger.error(f"处理接收到的事件时发生错误: {e}. Payload: {payload}", exc_info=True)
-                    else:
-                        logger.warning(f"接收到未知主题 '{topic}' 的消息。")
+                    try:
+                        event_dict = json.loads(payload.decode('utf-8'))
+                        
+                        if topic_str == "HEARTBEAT":
+                            self.last_heartbeat_time = time.time()
+                            logger.debug("Received EA heartbeat.")
+                            event = HeartbeatEvent(timestamp=int(time.time()))
+                            # 心跳事件通常不需要传递给回调
+                        elif topic_str == "TRADE_EVENT":
+                            # 从有效载荷中提取真正的事件类型
+                            event_type = event_dict.get("event_type")
+                            if not event_type:
+                                logger.warning(f"收到的交易事件缺少event_type字段: {event_dict}")
+                                continue
+                                
+                            # 创建事件对象并传递给回调
+                            try:
+                                # 不要修改原始event_dict，创建一个副本
+                                event = create_event_from_dict(event_dict)
+                                
+                                # 记录详细的主账户下单信息
+                                if event_type == "DEAL_ADD":
+                                    is_open = event_dict.get("entry") == "IN"
+                                    position_id = event_dict.get("position_id", 0)
+                                    ticket = event_dict.get("ticket", 0)
+                                    symbol = event_dict.get("symbol", "未知")
+                                    volume = event_dict.get("volume", 0)
+                                    price = event_dict.get("price", 0)
+                                    profit = event_dict.get("profit", 0)
+                                    trade_type = event_dict.get("type", "未知")
+                                    sl = event_dict.get("sl", 0)
+                                    tp = event_dict.get("tp", 0)
+                                    
+                                    action_type = "开仓" if is_open else "平仓"
+                                    sl_str = f", 止损: {sl}" if sl > 0 else ""
+                                    tp_str = f", 止盈: {tp}" if tp > 0 else ""
+                                    
+                                    detail_msg = (f"主账户{action_type}: 品种={symbol}, 类型={trade_type}, "
+                                                f"手数={volume}, 价格={price}, 订单号={ticket}, "
+                                                f"持仓ID={position_id}{sl_str}{tp_str}")
+                                    logger.info(detail_msg)
+                                    
+                                elif event_type == "ORDER_ADD":
+                                    ticket = event_dict.get("ticket", 0)
+                                    symbol = event_dict.get("symbol", "未知")
+                                    volume = event_dict.get("volume_initial", 0)
+                                    price = event_dict.get("price_open", 0)
+                                    trade_type = event_dict.get("type", "未知")
+                                    sl = event_dict.get("sl", 0)
+                                    tp = event_dict.get("tp", 0)
+                                    
+                                    sl_str = f", 止损: {sl}" if sl > 0 else ""
+                                    tp_str = f", 止盈: {tp}" if tp > 0 else ""
+                                    
+                                    detail_msg = (f"主账户挂单: 品种={symbol}, 类型={trade_type}, "
+                                                f"手数={volume}, 价格={price}, 订单号={ticket}{sl_str}{tp_str}")
+                                    logger.info(detail_msg)
+                                    
+                                elif event_type == "POSITION_MODIFY":
+                                    ticket = event_dict.get("ticket", 0)
+                                    symbol = event_dict.get("symbol", "未知")
+                                    sl = event_dict.get("sl", 0)
+                                    tp = event_dict.get("tp", 0)
+                                    
+                                    sl_str = f"止损: {sl}" if sl > 0 else "无止损"
+                                    tp_str = f"止盈: {tp}" if tp > 0 else "无止盈"
+                                    
+                                    detail_msg = (f"主账户修改持仓: 品种={symbol}, 持仓ID={ticket}, {sl_str}, {tp_str}")
+                                    logger.info(detail_msg)
+                                
+                                logger.info(f"成功处理交易事件: {event_type} {event_dict.get('symbol', '')}")
+                                self.event_callback(event)
+                            except ValueError as e:
+                                logger.warning(f"无法处理交易事件: {e}, 事件数据: {event_dict}")
+                            except Exception as e:
+                                logger.error(f"处理交易事件时发生未知错误: {e}", exc_info=True)
+                        else:
+                            # 直接使用主题作为事件类型
+                            event_dict["event_type"] = topic_str
+                            try:
+                                event = create_event_from_dict(event_dict)
+                                self.event_callback(event)
+                            except ValueError as e:
+                                logger.warning(f"无法处理事件: {e}")
 
-                # 如果超过心跳间隔没有收到心跳，则认为连接丢失
-                # if time.time() - self.last_heartbeat_time > (self.heartbeat_interval * 2):
-                #    logger.warning("Receive timeout (no heartbeat from EA). Connection may be lost.")
-                #    self._close_sockets() # 强制关闭以触发重连
-
+                    except (json.JSONDecodeError, ValueError, TypeError) as e:
+                        logger.error(f"Failed to process incoming event. Topic: {topic_str}, "
+                                    f"Payload: {payload.decode('utf-8')}, Error: {e}")
+                
+                # 检查心跳状态，但用更优雅的方式处理超时
+                current_time = time.time()
+                time_since_heartbeat = current_time - self.last_heartbeat_time
+                
+                # 如果超过一半的超时时间没有收到心跳，发出警告但不中断连接
+                if time_since_heartbeat > self.heartbeat_warning_threshold and current_time - last_warning_time > 10:
+                    logger.warning(f"已经 {time_since_heartbeat:.1f} 秒未收到EA心跳，但仍在等待...")
+                    last_warning_time = current_time
+                    self.last_warning_time = current_time
+                    
+                # 尝试主动请求心跳，增加连接容错性
+                # 降低重新握手的频率，仅当超过警告阈值且距离上次握手超过60秒时才尝试
+                if time_since_heartbeat > self.heartbeat_warning_threshold and current_time - self.last_handshake_time > 60:
+                    logger.info("长时间未收到心跳，尝试重新握手...")
+                    try:
+                        # 使用非阻塞方式发送ping请求
+                        if self._perform_handshake():
+                            logger.info("重新握手成功，恢复连接")
+                            continue
+                    except Exception as e:
+                        logger.error(f"尝试重新握手失败: {e}")
+                
+                # 只有真正超时很久才断开连接
+                if time_since_heartbeat > heartbeat_timeout:
+                    raise ConnectionAbortedError(f"超过 {heartbeat_timeout} 秒未收到EA心跳，连接已断开。")
+            
             except zmq.Again:
-                # 非阻塞操作，没有收到消息，这通常不是错误，只是没有事件发生
-                # logger.debug("ZMQ 非阻塞操作: 未收到消息。")
-                pass
+                # 非阻塞操作超时，正常情况
+                continue
+            except ConnectionAbortedError as e:
+                logger.error(f"心跳超时: {e}")
+                # 不在这里关闭套接字，而是让控制循环处理重连
+                return
             except zmq.ZMQError as e:
-                logger.error(f"ZMQ 事件接收错误: {e}", exc_info=True)
-                self._close_sockets() # 强制关闭套接字以进行干净的重新连接
-                break # 退出循环以尝试重新连接
+                logger.error(f"ZMQ错误: {e}")
+                # 不在这里关闭套接字，而是让控制循环处理重连
+                return
             except Exception as e:
-                logger.error(f"接收事件时发生意外错误: {e}", exc_info=True)
-                self._close_sockets() # 确保在所有错误上关闭套接字
-                break # 退出循环以尝试重新连接
-
-    def _listen_for_events(self):
-        # 持续监听 ZeroMQ 事件总线以获取事件。此函数在当前实现中可能未被直接使用，其逻辑已合并到 _receive_events。保留此函数是为了可能的未来扩展或作为参考。
-        pass # 逻辑已合并到 _receive_events
+                logger.error(f"接收循环中发生未知错误: {e}", exc_info=True)
+                # 不在这里关闭套接字，而是让控制循环处理重连
+                return

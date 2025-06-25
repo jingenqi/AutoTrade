@@ -1,7 +1,10 @@
-pyzmq
-pydantic
-rich
-PyQt5
-pytest
-pytest-qt
-pytest-mock 
+pytest>=7.0.0
+pytest-qt>=4.2.0
+pytest-mock>=3.10.0
+pytest-cov>=4.1.0
+pytest-xvfb>=2.0.0
+pyzmq>=25.0.0
+rich>=13.0.0
+pydantic>=1.10.0
+PyQt5>=5.15.0
+coverage>=7.0.0 
